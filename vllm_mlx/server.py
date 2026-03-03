@@ -153,6 +153,26 @@ _auth_warning_logged: bool = False
 # Reasoning parser (for models like Qwen3, DeepSeek-R1)
 _reasoning_parser = None  # ReasoningParser instance when enabled
 
+# Thinking/reasoning mode default (set via CLI --enable-thinking / --no-thinking)
+_default_enable_thinking: bool | None = None  # None = auto (model heuristic)
+
+
+def _resolve_enable_thinking(reasoning_effort: str | None) -> bool | None:
+    """Map reasoning_effort API parameter to enable_thinking bool.
+
+    Returns:
+        True/False to explicitly set thinking mode, or None to use default.
+    """
+    if reasoning_effort is None:
+        return _default_enable_thinking
+    effort = reasoning_effort.lower().strip()
+    if effort == "none":
+        return False
+    if effort in ("low", "medium", "high"):
+        return True
+    return _default_enable_thinking
+
+
 # Tool calling configuration
 _enable_auto_tool_choice: bool = False
 _tool_call_parser: str | None = None  # Parser name: auto, mistral, qwen, llama, hermes
@@ -1362,6 +1382,11 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
     # Add tools if provided
     if request.tools:
         chat_kwargs["tools"] = convert_tools_for_template(request.tools)
+
+    # Resolve thinking mode from reasoning_effort parameter
+    enable_thinking = _resolve_enable_thinking(request.reasoning_effort)
+    if enable_thinking is not None:
+        chat_kwargs["enable_thinking"] = enable_thinking
 
     if request.stream:
         return StreamingResponse(

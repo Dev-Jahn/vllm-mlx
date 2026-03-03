@@ -708,6 +708,7 @@ class MLXMultimodalLM:
         self.processor = None
         self.config = None
         self._loaded = False
+        self._enable_thinking = False  # Set to True to enable thinking/reasoning mode
 
         # Initialize MLLM prefix cache manager (with vision embedding caching)
         self._cache_manager: MLLMPrefixCacheManager | None = None
@@ -1049,13 +1050,16 @@ class MLXMultimodalLM:
         from mlx_vlm import generate
         from mlx_vlm.prompt_utils import get_chat_template
 
+        # Per-request enable_thinking override (from reasoning_effort API param)
+        enable_thinking = kwargs.pop("enable_thinking", self._enable_thinking)
+
         # Extract text and images from messages
         # Build chat_messages for multi-turn support WITH proper image tokens per message
         all_image_urls = []  # Raw URLs/paths to process later
         videos = []
         chat_messages = []  # List of properly formatted messages for chat template
 
-        logger.info(f"MLLM.chat() called with {len(messages)} messages")
+        logger.info(f"MLLM.chat() called with {len(messages)} messages, enable_thinking={enable_thinking}")
 
         for msg in messages:
             role = msg.get("role", "user")
@@ -1158,6 +1162,7 @@ class MLXMultimodalLM:
                 self.processor,
                 chat_messages,
                 add_generation_prompt=True,
+                enable_thinking=enable_thinking,
             )
         except Exception as e:
             logger.warning(
@@ -1412,6 +1417,12 @@ class MLXMultimodalLM:
             yield output
             return
 
+        # Per-request enable_thinking override (from reasoning_effort API param)
+        enable_thinking = kwargs.pop("enable_thinking", self._enable_thinking)
+        logger.info(
+            f"MLLM.stream_chat() called with {len(messages)} messages, enable_thinking={enable_thinking}"
+        )
+
         # Extract text and images from messages
         # Build chat_messages for multi-turn support WITH proper image tokens per message
         all_image_urls = []  # Raw URLs/paths to process later
@@ -1510,6 +1521,7 @@ class MLXMultimodalLM:
                 self.processor,
                 chat_messages,
                 add_generation_prompt=True,
+                enable_thinking=enable_thinking,
             )
         except Exception as e:
             logger.warning(

@@ -59,6 +59,13 @@ def serve_command(args):
     if args.default_top_p is not None:
         server._default_top_p = args.default_top_p
 
+    # Configure thinking mode default
+    if args.enable_thinking:
+        server._default_enable_thinking = True
+    elif args.no_thinking:
+        server._default_enable_thinking = False
+    # else: None (auto - model heuristic / per-request reasoning_effort)
+
     # Configure reasoning parser
     if args.reasoning_parser:
         try:
@@ -103,6 +110,12 @@ def serve_command(args):
         print(f"  Reasoning: ENABLED (parser: {args.reasoning_parser})")
     else:
         print("  Reasoning: Use --reasoning-parser to enable")
+    if args.enable_thinking:
+        print("  Thinking: ENABLED (--enable-thinking)")
+    elif args.no_thinking:
+        print("  Thinking: DISABLED (--no-thinking)")
+    else:
+        print("  Thinking: AUTO (controllable via reasoning_effort API param)")
     print("=" * 60)
 
     print(f"Loading model: {args.model}")
@@ -800,6 +813,20 @@ Examples:
             "Extracts <think>...</think> tags into reasoning_content field. "
             f"Options: {', '.join(reasoning_choices)}."
         ),
+    )
+    # Thinking mode control
+    thinking_group = serve_parser.add_mutually_exclusive_group()
+    thinking_group.add_argument(
+        "--enable-thinking",
+        action="store_true",
+        default=None,
+        help="Enable thinking/reasoning mode in chat templates (default for thinking-capable models)",
+    )
+    thinking_group.add_argument(
+        "--no-thinking",
+        action="store_true",
+        default=None,
+        help="Disable thinking/reasoning mode in chat templates",
     )
     # Multimodal option
     serve_parser.add_argument(

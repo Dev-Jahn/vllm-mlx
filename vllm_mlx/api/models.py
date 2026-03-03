@@ -169,6 +169,10 @@ class ChatCompletionRequest(BaseModel):
     tool_choice: str | dict | None = None  # "auto", "none", or specific tool
     # Structured output
     response_format: ResponseFormat | dict | None = None
+    # Reasoning/thinking mode control (OpenAI-compatible)
+    # "none" = disable thinking, "low"/"medium"/"high" = enable thinking
+    # None = use server default
+    reasoning_effort: str | None = None
     # MLLM-specific parameters
     video_fps: float | None = None
     video_max_frames: int | None = None

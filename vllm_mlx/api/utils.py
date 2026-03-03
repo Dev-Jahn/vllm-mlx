@@ -120,6 +120,8 @@ MLLM_PATTERNS = [
     "gemma3",  # Gemma 3 (multimodal)
     "medgemma",
     "MedGemma",  # MedGemma (medical multimodal with SigLIP vision encoder)
+    "Qwen3.5",
+    "qwen3_5",  # Qwen3.5 (omni multimodal with built-in vision tower)
     "pixtral",
     "Pixtral",  # Pixtral
     "molmo",

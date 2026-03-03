@@ -74,7 +74,7 @@ vllm = [
     "vllm>=0.4.0",
 ]
 vision = [
-    "torch>=2.3.0",
+    "torch>=2.4.0",
     "torchvision>=0.18.0",
 ]
 # Audio dependencies for TTS/STT (mlx-audio)
@@ -136,3 +136,6 @@ ignore_missing_imports = true
 testpaths = ["tests"]
 python_files = ["test_*.py"]
 asyncio_mode = "auto"
+
+[tool.uv]
+prerelease = "allow"
