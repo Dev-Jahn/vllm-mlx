@@ -210,7 +210,7 @@ def serve_command(args):
         stream_interval=args.stream_interval if args.continuous_batching else 1,
         max_tokens=args.max_tokens,
         force_mllm=args.mllm,
-        served_model_name=args.served_model_name,
+        served_model_name=args.served_model_name or args.model.rstrip('/').split('/')[-1],
         mtp=args.enable_mtp,
         prefill_step_size=args.prefill_step_size,
         specprefill_enabled=args.specprefill,

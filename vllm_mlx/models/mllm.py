@@ -869,12 +869,28 @@ class MLXMultimodalLM:
         if tools:
             template_kwargs["tools"] = tools
 
-        text = self.processor.apply_chat_template(
-            native_messages,
-            tokenize=False,
-            add_generation_prompt=True,
-            **template_kwargs,
-        )
+        # Try processor first, then fall back to tokenizer for chat template.
+        # Some processors (e.g. Qwen3-VL) have the method but raise ValueError
+        # because they lack an internal chat_template attribute.
+        text = None
+        for applier in [self.processor, getattr(self.processor, "tokenizer", None)]:
+            if applier is None or not hasattr(applier, "apply_chat_template"):
+                continue
+            try:
+                text = applier.apply_chat_template(
+                    native_messages,
+                    tokenize=False,
+                    add_generation_prompt=True,
+                    **template_kwargs,
+                )
+                break
+            except (ValueError, Exception):
+                continue
+        if text is None:
+            raise ValueError(
+                "Neither processor nor tokenizer could apply chat template. "
+                "Ensure you are using a supported model/tokenizer."
+            )
 
         # Extract vision inputs via mlx-vlm's process_vision_info
         image_inputs, video_inputs, fps_info = process_vision_info(
