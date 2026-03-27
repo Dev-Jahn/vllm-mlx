@@ -173,6 +173,8 @@ class ChatCompletionRequest(BaseModel):
     # "none" = disable thinking, "low"/"medium"/"high" = enable thinking
     # None = use server default
     reasoning_effort: str | None = None
+    # Thinking budget: max tokens for thinking before forcing </think>
+    thinking_budget: int | None = None
     # MLLM-specific parameters
     video_fps: float | None = None
     video_max_frames: int | None = None

@@ -1449,6 +1449,13 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
     enable_thinking = _resolve_enable_thinking(request.reasoning_effort)
     if enable_thinking is not None:
         chat_kwargs["enable_thinking"] = enable_thinking
+    if request.thinking_budget is not None:
+        chat_kwargs["thinking_budget"] = request.thinking_budget
+        chat_kwargs["thinking_start_token"] = "<think>"
+        chat_kwargs["thinking_end_token"] = "</think>"
+        # thinking_budget requires enable_thinking=True for the budget
+        # criteria to track and limit thinking tokens
+        chat_kwargs["enable_thinking"] = True
 
     if request.stream:
         return StreamingResponse(

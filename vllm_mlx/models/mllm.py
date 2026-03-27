@@ -1335,6 +1335,10 @@ class MLXMultimodalLM:
 
         # Per-request enable_thinking override (from reasoning_effort API param)
         enable_thinking = kwargs.pop("enable_thinking", self._enable_thinking)
+        # If thinking_budget is set, ensure enable_thinking is passed through
+        # to mlx-vlm so ThinkingBudgetCriteria can track thinking tokens
+        if "thinking_budget" in kwargs and enable_thinking:
+            kwargs["enable_thinking"] = True
 
         # Extract text and images from messages
         # Build chat_messages for multi-turn support WITH proper image tokens per message
@@ -1738,6 +1742,10 @@ class MLXMultimodalLM:
 
         # Per-request enable_thinking override (from reasoning_effort API param)
         enable_thinking = kwargs.pop("enable_thinking", self._enable_thinking)
+        # If thinking_budget is set, ensure enable_thinking is passed through
+        # to mlx-vlm so ThinkingBudgetCriteria can track thinking tokens
+        if "thinking_budget" in kwargs and enable_thinking:
+            kwargs["enable_thinking"] = True
         logger.info(
             f"MLLM.stream_chat() called with {len(messages)} messages, enable_thinking={enable_thinking}"
         )
