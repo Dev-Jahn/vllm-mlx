@@ -640,11 +640,13 @@ MLLM_PATTERNS = [
 ]
 
 # Test image URL (Yellow Labrador from Wikimedia Commons)
-MLLM_TEST_IMAGE_URL = "https://upload.wikimedia.org/wikipedia/commons/thumb/2/26/YellowLabradorLooking_new.jpg/1200px-YellowLabradorLooking_new.jpg"
+# Original (non-thumbnail) URLs: Wikimedia rejects arbitrary thumbnail sizes
+# with HTTP 400 ("Use thumbnail sizes listed on https://w.wiki/GHai")
+MLLM_TEST_IMAGE_URL = "https://upload.wikimedia.org/wikipedia/commons/2/26/YellowLabradorLooking_new.jpg"
 MLLM_TEST_IMAGE_URLS = [
     MLLM_TEST_IMAGE_URL,
-    "https://upload.wikimedia.org/wikipedia/commons/thumb/3/3a/Cat03.jpg/1200px-Cat03.jpg",
-    "https://upload.wikimedia.org/wikipedia/commons/thumb/4/47/PNG_transparency_demonstration_1.png/640px-PNG_transparency_demonstration_1.png",
+    "https://upload.wikimedia.org/wikipedia/commons/3/3a/Cat03.jpg",
+    "https://upload.wikimedia.org/wikipedia/commons/4/47/PNG_transparency_demonstration_1.png",
 ]
 
 
@@ -876,8 +878,7 @@ def run_mllm_benchmark(
         base_image = download_test_image(MLLM_TEST_IMAGE_URL)
         print(f"  Original size: {base_image.size[0]}x{base_image.size[1]}\n")
     except Exception as e:
-        print(f"Error downloading image: {e}")
-        return []
+        raise SystemExit(f"Error downloading test image, aborting benchmark: {e}")
 
     # Warmup
     if warmup_runs > 0:
