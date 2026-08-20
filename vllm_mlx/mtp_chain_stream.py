@@ -9,12 +9,22 @@ loop, DeepSeek-V3 style: the single MTP layer is applied *recursively* to
 draft N tokens per round, all N drafts are verified in one target forward,
 and the longest exactly-matching prefix is accepted.
 
+The drafter keeps a persistent KV cache over the whole request (upstream
+mlx-vlm's Qwen MTP drafter informed this design). MTP cache position ``p``
+holds the pair ``(target_hidden(p), token(p+1))``; the head's output at
+pair ``p`` predicts token ``p+2``. During prompt prefill every prompt
+position's pair is fed (one cheap single-layer pass per chunk), so drafts
+are conditioned on the full context instead of a per-round scratch cache.
+After each verify, the round's speculative chain pairs are trimmed and the
+committed positions are re-fed with *target* hidden states, so the drafter
+cache only ever contains full-context, target-hidden pairs. The last output
+of that advance feed is the next round's first draft for free (the "seed").
+
 Per round (greedy decoding only):
 
-1. Chain-draft: from the last committed token ``y`` and the target hidden
-   state ``h`` at the previous position, run ``mtp_forward`` N times. Each
-   step feeds the previous step's MTP hidden state and drafted token back in
-   (with a fresh per-round MTP KV cache, so chain steps attend to each other).
+1. Chain-draft: ``d_1`` is the seed from the previous advance feed; each
+   further step feeds the previous step's MTP hidden state and drafted token
+   back in (DeepSeek-V3-style recursion over the single MTP layer).
 2. Verify: run the target once on ``[y, d_1, ..., d_N]`` with
    ``return_hidden=True``. ``argmax`` of the target logits at position ``i``
    is the target's own choice for the token after ``d_i``.
@@ -31,6 +41,10 @@ Per round (greedy decoding only):
    Fully-accepted rounds skip all of this. This trades one extra short
    forward per partially-rejected round for never having to roll recurrent
    state back token-by-token — correctness over speed.
+5. Drafter advance: trim the chain pairs appended in step 1, then feed the
+   committed pairs ``(Hv[i], token(i+1))`` for the accepted drafts and the
+   bonus token in one batched single-layer forward; its last logits row is
+   the next round's ``d_1``.
 
 The ``ArraysCache`` snapshot is safe because ``GatedDeltaNet`` writes its
 state back by *rebinding* the cache slots (``cache[0] = ...``) with freshly
@@ -41,6 +55,16 @@ silently corrupting state (see :func:`cache_supports_chained_mtp`).
 
 Sampling: this generator is greedy-only (draft and verify both use argmax).
 Callers must route ``temperature > 0`` requests to the non-speculative path.
+
+Numerics: on Metal the batched verify forward (T = N+1) does not produce
+bit-identical logits to a single-token forward — different matmul/kernel
+paths accumulate in a different order, and near-tied top-2 candidates can
+flip. Measured on Qwen3.8-27B-4bit this flips roughly one argmax per
+50-150 generated tokens, so speculative output is greedy-equivalent but not
+guaranteed byte-identical to non-speculative decoding. This is inherent to
+batched verification (mlx_lm's own draft-model speculative path has the
+same property), not an acceptance-logic defect: in observed divergences the
+emitted token always equals the batched-verify argmax.
 """
 
 from __future__ import annotations
@@ -103,6 +127,7 @@ def mtp_chain_stream_generate(
     prompt_cache: Optional[List[Any]] = None,
     prefill_step_size: int = 2048,
     stats: Optional[dict] = None,
+    round_log: Optional[list] = None,
 ) -> Generator[Any, None, None]:
     """Greedy chained-MTP speculative stream mirroring ``mlx_lm.stream_generate``.
 
@@ -123,6 +148,9 @@ def mtp_chain_stream_generate(
         prefill_step_size: Chunk size for prompt prefill.
         stats: Optional dict of cumulative counters (``requests``, ``rounds``,
           ``drafted``, ``accepted``) updated in place across requests.
+        round_log: Optional list; when given, a per-round diagnostics dict
+          (drafts, verify targets, accepted count) is appended for each
+          speculative round. Debugging aid — off in production.
     """
     from mlx_lm.generate import GenerationResponse, generation_stream, wired_limit
     from mlx_lm.models.cache import make_prompt_cache
@@ -166,6 +194,16 @@ def mtp_chain_stream_generate(
             f"risk silent cache corruption."
         )
 
+    mtp_cache = model.make_mtp_cache()
+    if not mtp_cache or not all(
+        callable(getattr(c, "is_trimmable", None)) and c.is_trimmable()
+        for c in mtp_cache
+    ):
+        raise ValueError(
+            "Chained MTP requires a trimmable MTP drafter cache "
+            "(make_mtp_cache must return KVCache-like entries)."
+        )
+
     if stats is not None:
         stats["requests"] = stats.get("requests", 0) + 1
     request_drafted = 0
@@ -173,30 +211,41 @@ def mtp_chain_stream_generate(
 
     total_prompt_tokens = int(prompt.size)
 
-    def _round(y_tok: mx.array, h: mx.array, n_draft: int):
+    def _round(
+        y_tok: mx.array,
+        h: mx.array,
+        seed_tok: mx.array,
+        seed_h: mx.array,
+        n_draft: int,
+    ):
         """One speculative round.
 
         Args:
             y_tok: shape (1,) — last emitted token, not yet fed to the target.
             h: shape (1, 1, H) — target hidden state at the last fed position.
+            seed_tok: shape (1, 1) — the drafter's prediction of the token
+              after ``y_tok`` (from the previous advance feed); used as d_1.
+            seed_h: shape (1, 1, H) — MTP hidden state paired with seed_tok.
             n_draft: chain depth for this round (may be < num_draft_tokens
               near the max_tokens budget; 0 falls back to a plain decode step).
 
         Returns:
-            (committed, new_y, new_h, accepted, drafted) where committed is a
-            list of (token_id, logprobs_row, from_draft) in emission order —
-            the accepted drafts followed by the target bonus token.
+            (committed, new_y, new_h, new_seed_tok, new_seed_h, accepted,
+            drafted) where committed is a list of
+            (token_id, logprobs_row, from_draft) in emission order — the
+            accepted drafts followed by the target bonus token.
         """
         drafts = None
+        chain_appended = 0
         if n_draft > 0:
-            mtp_cache = model.make_mtp_cache()
-            chain: List[mx.array] = []
-            d_h = h
-            d_tok = y_tok[None]  # (1, 1)
-            for _ in range(n_draft):
+            chain: List[mx.array] = [seed_tok]
+            d_h = seed_h
+            d_tok = seed_tok
+            for _ in range(n_draft - 1):
                 d_logits, d_h = model.mtp_forward(
                     d_h, d_tok, mtp_cache=mtp_cache, return_hidden=True
                 )
+                chain_appended += 1
                 d_tok = mx.argmax(d_logits[:, -1:, :], axis=-1)  # (1, 1)
                 chain.append(d_tok)
             drafts = mx.concatenate(chain, axis=1)  # (1, n_draft)
@@ -220,6 +269,16 @@ def mtp_chain_stream_generate(
         while accepted < n_draft and targets_list[accepted] == drafts_list[accepted]:
             accepted += 1
 
+        if round_log is not None:
+            round_log.append(
+                {
+                    "verify_in": [int(t) for t in verify_in[0].tolist()],
+                    "drafts": list(drafts_list),
+                    "targets": list(targets_list),
+                    "accepted": accepted,
+                }
+            )
+
         rejected = n_draft - accepted
         if rejected > 0:
             # Roll every entry back to the pre-verify state, then advance by
@@ -233,6 +292,23 @@ def mtp_chain_stream_generate(
                 c.state = s
             model(verify_in[:, : 1 + accepted], cache=cache)
 
+        # Drafter advance: drop this round's speculative chain pairs, then
+        # feed the committed pairs (Hv[i], token(i+1)) — accepted drafts plus
+        # the bonus — with target hidden states. The last output row predicts
+        # the token after the bonus: the next round's d_1, for free.
+        for c in mtp_cache:
+            c.trim(chain_appended)
+        adv_hidden = v_hidden[:, : accepted + 1, :]
+        adv_tokens = mx.concatenate(
+            [verify_in[:, 1 : 1 + accepted], v_targets[:, accepted : accepted + 1]],
+            axis=1,
+        )
+        s_logits, s_hidden = model.mtp_forward(
+            adv_hidden, adv_tokens, mtp_cache=mtp_cache, return_hidden=True
+        )
+        new_seed_tok = mx.argmax(s_logits[:, -1:, :], axis=-1)  # (1, 1)
+        new_seed_h = s_hidden[:, -1:, :]
+
         lp = v_logits[:, : accepted + 1, :]
         lp = lp - mx.logsumexp(lp, axis=-1, keepdims=True)
         committed = []
@@ -242,17 +318,26 @@ def mtp_chain_stream_generate(
 
         new_y = v_targets[:, accepted]  # (1,)
         new_h = v_hidden[:, accepted : accepted + 1, :]
-        return committed, new_y, new_h, accepted, n_draft
+        return committed, new_y, new_h, new_seed_tok, new_seed_h, accepted, n_draft
 
     with wired_limit(model, [generation_stream]):
         tic = time.perf_counter()
         with mx.stream(generation_stream):
-            # Chunked prefill of all but the last prompt token.
+            # Chunked prefill of all but the last prompt token, feeding the
+            # drafter the pair (hidden(p), token(p+1)) for every position so
+            # drafts are conditioned on the full context.
             remaining = prompt
+            fed = 0
             while remaining.size > 1:
                 n_to_process = min(prefill_step_size, remaining.size - 1)
-                model(remaining[:n_to_process][None], cache=cache)
+                _, chunk_hidden = model(
+                    remaining[:n_to_process][None], cache=cache, return_hidden=True
+                )
+                pair_tokens = prompt[fed + 1 : fed + n_to_process + 1]
+                model.mtp_forward(chunk_hidden, pair_tokens[None], mtp_cache=mtp_cache)
                 mx.eval([c.state for c in cache])
+                mx.eval([c.state for c in mtp_cache])
+                fed += n_to_process
                 remaining = remaining[n_to_process:]
                 mx.clear_cache()
 
@@ -261,6 +346,13 @@ def mtp_chain_stream_generate(
             y_tok = mx.argmax(last_logits, axis=-1)  # (1,)
             h = hidden[:, -1:, :]
             first_lp = (last_logits - mx.logsumexp(last_logits, keepdims=True))[0]
+            # Bootstrap the drafter: feed the final prompt pair (h, y0); its
+            # output is round 1's first draft.
+            seed_logits, seed_hidden = model.mtp_forward(
+                h, y_tok[None], mtp_cache=mtp_cache, return_hidden=True
+            )
+            seed_tok = mx.argmax(seed_logits[:, -1:, :], axis=-1)  # (1, 1)
+            seed_h = seed_hidden[:, -1:, :]
             mx.eval(y_tok)
 
         prompt_time = time.perf_counter() - tic
@@ -312,7 +404,15 @@ def mtp_chain_stream_generate(
 
             n_draft = min(num_draft_tokens, max_tokens - n - 1)
             with mx.stream(generation_stream):
-                pending, y_tok, h, accepted, drafted = _round(y_tok, h, n_draft)
+                (
+                    pending,
+                    y_tok,
+                    h,
+                    seed_tok,
+                    seed_h,
+                    accepted,
+                    drafted,
+                ) = _round(y_tok, h, seed_tok, seed_h, n_draft)
             request_drafted += drafted
             request_accepted += accepted
             if stats is not None:

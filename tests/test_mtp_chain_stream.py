@@ -157,10 +157,12 @@ class StubMTPModel:
         mtp_cache=None,
         return_hidden=False,
     ):
-        assert mtp_cache is not None, "chain must pass a per-round MTP cache"
+        assert mtp_cache is not None, "generator must pass the drafter cache"
+        self.seen_mtp_cache = mtp_cache
+        seq = next_token_ids.shape[1]
         tok = int(next_token_ids[0, -1].item())
-        self.mtp_calls.append((tok, mtp_cache[0].offset))
-        # Exercise the per-round MTP KV cache like a real attention layer.
+        self.mtp_calls.append((tok, mtp_cache[0].offset, seq))
+        # Exercise the persistent drafter KV cache like a real attention layer.
         k = next_token_ids.astype(mx.float32)[:, None, :, None]
         mtp_cache[0].update_and_fetch(k, k)
         draft = self._draft_rule(tok)
@@ -201,10 +203,24 @@ class TestChainedDraftAndAcceptance:
         assert stats["rounds"] == 3
         assert stats["drafted"] == 6
         assert stats["accepted"] == 6
-        # The chain ran N times per drafting round.
-        assert [c[0] for c in model.mtp_calls] == [1, 2, 3, 5, 6, 7]
-        # Fresh per-round MTP cache: offsets restart at 0 each round.
-        assert [c[1] for c in model.mtp_calls] == [0, 1, 2, 0, 1, 2]
+        # Drafter-call schedule with the persistent seeded cache:
+        # bootstrap pair (y0=1) at offset 0; round 1 chains d2,d3 from seed=2
+        # then advance-feeds the 4 committed pairs (last token = bonus 5);
+        # round 2 likewise; the closing 0-draft round only advance-feeds the
+        # bonus. Tuples are (last_token, cache_offset_at_call, batch_T).
+        assert model.mtp_calls == [
+            (1, 0, 1),  # bootstrap
+            (2, 1, 1),  # r1 chain -> d2
+            (3, 2, 1),  # r1 chain -> d3
+            (5, 1, 4),  # r1 advance: pairs for d1,d2,d3,bonus
+            (6, 5, 1),  # r2 chain
+            (7, 6, 1),  # r2 chain
+            (9, 5, 4),  # r2 advance
+            (10, 9, 1),  # r3 (0-draft) advance: bonus pair only
+        ]
+        # Persistent drafter cache holds exactly one pair per committed
+        # position at the end (positions 0..9 -> pairs 0..9).
+        assert model.seen_mtp_cache[0].offset == 10
         # No rejected round -> no replay forwards: prefill(1), verify(4),
         # verify(4), closing verify(1).
         assert model.forward_lens == [1, 4, 4, 1]
@@ -259,6 +275,32 @@ class TestChainedDraftAndAcceptance:
         responses, detok = _run(model, [0], max_tokens=6, num_draft_tokens=1)
         assert detok.tokens == list(range(1, 7))
         assert responses[-1].finish_reason == "length"
+
+    def test_prompt_prefill_feeds_drafter_pairs(self):
+        """Chunked prompt prefill must feed the drafter one (hidden, next
+        token) pair per prompt position, in order, before the bootstrap."""
+        model = StubMTPModel(wrong_token=None)
+        tokenizer = StubTokenizer()
+        list(
+            mtp_chain_stream_generate(
+                model,
+                tokenizer,
+                mx.array([10, 11, 12, 13, 14, 15]),
+                max_tokens=4,
+                num_draft_tokens=2,
+                prefill_step_size=2,
+            )
+        )
+        # prompt[:-1] chunks of 2: pairs for tokens [11,12], [13,14], [15];
+        # then the bootstrap pair for y0=16 at offset 5.
+        assert model.mtp_calls[:4] == [
+            (12, 0, 2),
+            (14, 2, 2),
+            (15, 4, 1),
+            (16, 5, 1),  # bootstrap
+        ]
+        # Output must still be the plain autoregressive continuation.
+        assert tokenizer.detokenizer.tokens == [16, 17, 18, 19]
 
 
 class TestCacheConsistency:

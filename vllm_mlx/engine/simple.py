@@ -2907,7 +2907,7 @@ class SimpleEngine(BaseEngine):
             ):
                 # Resume the content phase with chained multi-token drafting
                 # on the retained backbone cache. The MTP head's KV cache is
-                # per-round inside the generator, so no stale speculative
+                # request-scoped inside the generator, so no stale speculative
                 # state can survive the processor-to-content handoff.
                 from ..mtp_chain_stream import mtp_chain_stream_generate
 
@@ -3062,7 +3062,7 @@ class SimpleEngine(BaseEngine):
             # Runs the speculative draft/verify loop in vllm_mlx instead of
             # mlx_lm.stream_generate (which drops num_draft_tokens without a
             # draft model). Uses the backbone cache only; the MTP head's KV
-            # cache is managed per-round inside the generator.
+            # cache is managed inside the generator (request-scoped).
             if use_chained_mtp:
                 from ..mtp_chain_stream import mtp_chain_stream_generate
 
