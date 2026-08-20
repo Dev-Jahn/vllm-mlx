@@ -127,6 +127,7 @@ class RegistryServeDefaults:
     scheduler_config: SchedulerConfig | None
     max_tokens: int
     download_config: DownloadConfig
+    mtp_num_draft_tokens: int = 1
 
 
 @dataclass(frozen=True)
@@ -156,6 +157,7 @@ class RegisteredModel:
     continuous_batching: bool | None = None
     force_mllm: bool | None = None
     enable_mtp: bool | None = None
+    mtp_num_draft_tokens: int | None = None
     prefill_step_size: int | None = None
     specprefill_enabled: bool | None = None
     specprefill_threshold: int | None = None
@@ -192,6 +194,7 @@ class ResolvedModelConfig:
     gpu_memory_utilization: float
     scheduler_config: SchedulerConfig | None
     estimated_memory_bytes: int
+    mtp_num_draft_tokens: int = 1
 
 
 @dataclass
@@ -633,6 +636,7 @@ def load_registry_config(
             continuous_batching=item.get("continuous_batching"),
             force_mllm=item.get("mllm"),
             enable_mtp=item.get("enable_mtp"),
+            mtp_num_draft_tokens=item.get("mtp_num_draft_tokens"),
             prefill_step_size=item.get("prefill_step_size"),
             specprefill_enabled=item.get("specprefill"),
             specprefill_threshold=item.get("specprefill_threshold"),
@@ -1086,6 +1090,7 @@ class ModelManager:
                 model_name=config.resolved_source,
                 force_mllm=config.force_mllm,
                 mtp=config.enable_mtp,
+                mtp_num_draft_tokens=config.mtp_num_draft_tokens,
                 prefill_step_size=config.prefill_step_size,
                 specprefill_enabled=config.specprefill_enabled,
                 specprefill_threshold=config.specprefill_threshold,
@@ -1168,6 +1173,11 @@ class ModelManager:
             if entry.enable_mtp is not None
             else self._defaults.enable_mtp
         )
+        mtp_num_draft_tokens = (
+            entry.mtp_num_draft_tokens
+            if entry.mtp_num_draft_tokens is not None
+            else self._defaults.mtp_num_draft_tokens
+        )
         prefill_step_size = (
             entry.prefill_step_size
             if entry.prefill_step_size is not None
@@ -1231,6 +1241,7 @@ class ModelManager:
             continuous_batching=continuous_batching,
             force_mllm=force_mllm,
             enable_mtp=enable_mtp,
+            mtp_num_draft_tokens=mtp_num_draft_tokens,
             prefill_step_size=prefill_step_size,
             specprefill_enabled=specprefill_enabled,
             specprefill_threshold=specprefill_threshold,

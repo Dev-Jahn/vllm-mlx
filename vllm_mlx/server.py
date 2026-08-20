@@ -1323,6 +1323,7 @@ def _build_engine(spec: ModelSpec) -> BaseEngine:
         model_name=spec.model_name,
         force_mllm=spec.force_mllm,
         mtp=spec.mtp,
+        mtp_num_draft_tokens=spec.mtp_num_draft_tokens,
         prefill_step_size=spec.prefill_step_size,
         specprefill_enabled=spec.specprefill_enabled,
         specprefill_threshold=spec.specprefill_threshold,
@@ -3258,6 +3259,7 @@ def load_model(
     served_model_name: str | None = None,
     trust_remote_code: bool = False,
     mtp: bool = False,
+    mtp_num_draft_tokens: int = 1,
     prefill_step_size: int = 2048,
     specprefill_enabled: bool = False,
     specprefill_threshold: int = 8192,
@@ -3287,6 +3289,8 @@ def load_model(
         force_mllm: Force loading as MLLM even if not auto-detected
         trust_remote_code: Allow HuggingFace remote code execution during model/tokenizer loading
         mtp: Enable native MTP speculative decoding (SimpleEngine only)
+        mtp_num_draft_tokens: Speculative draft depth per MTP round
+            (SimpleEngine text route; >1 enables chained drafting)
         prefill_step_size: Chunk size for prompt prefill processing (default: 2048)
         specprefill_enabled: Enable SpecPrefill (SimpleEngine only)
         specprefill_threshold: Minimum suffix tokens to trigger SpecPrefill (default: 8192)
@@ -3387,6 +3391,7 @@ def load_model(
             max_tokens=max_tokens,
             force_mllm=force_mllm,
             mtp=mtp,
+            mtp_num_draft_tokens=mtp_num_draft_tokens,
             prefill_step_size=prefill_step_size,
             specprefill_enabled=specprefill_enabled,
             specprefill_threshold=specprefill_threshold,
@@ -3442,6 +3447,7 @@ def load_model(
             trust_remote_code=trust_remote_code,
             force_mllm=force_mllm,
             mtp=mtp,
+            mtp_num_draft_tokens=mtp_num_draft_tokens,
             prefill_step_size=prefill_step_size,
             specprefill_enabled=specprefill_enabled,
             specprefill_threshold=specprefill_threshold,

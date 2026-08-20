@@ -36,6 +36,7 @@ class ModelSpec:
     max_tokens: int = 32768
     force_mllm: bool = False
     mtp: bool = False
+    mtp_num_draft_tokens: int = 1
     prefill_step_size: int = 2048
     specprefill_enabled: bool = False
     specprefill_threshold: int = 8192
