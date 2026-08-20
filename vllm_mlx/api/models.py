@@ -9,10 +9,12 @@ These models define the request and response schemas for:
 - MCP (Model Context Protocol) integration
 """
 
+import re
 import time
 import uuid
+from typing import Any
 
-from pydantic import BaseModel, Field, computed_field
+from pydantic import AliasChoices, BaseModel, Field, model_serializer, model_validator
 
 # =============================================================================
 # Content Types (for multimodal messages)
@@ -87,6 +89,9 @@ class Message(BaseModel):
 # =============================================================================
 
 
+_OPENAI_FUNCTION_NAME_RE = re.compile(r"[A-Za-z0-9_-]{1,64}")
+
+
 class FunctionCall(BaseModel):
     """A function call with name and arguments."""
 
@@ -107,6 +112,15 @@ class ToolDefinition(BaseModel):
 
     type: str = "function"
     function: dict
+
+    @model_validator(mode="after")
+    def _validate_openai_function_name(self):
+        if self.type != "function":
+            return self
+        name = self.function.get("name")
+        if not isinstance(name, str) or not _OPENAI_FUNCTION_NAME_RE.fullmatch(name):
+            raise ValueError("function.name must match ^[A-Za-z0-9_-]{1,64}$")
+        return self
 
 
 # =============================================================================
@@ -158,7 +172,10 @@ class ChatCompletionRequest(BaseModel):
     messages: list[Message]
     temperature: float | None = None
     top_p: float | None = None
-    max_tokens: int | None = None
+    top_k: int | None = None
+    min_p: float | None = None
+    presence_penalty: float | None = None
+    max_tokens: int | None = Field(default=None, gt=0)
     stream: bool = False
     stream_options: StreamOptions | None = (
         None  # Streaming options (include_usage, etc.)
@@ -169,21 +186,32 @@ class ChatCompletionRequest(BaseModel):
     tool_choice: str | dict | None = None  # "auto", "none", or specific tool
     # Structured output
     response_format: ResponseFormat | dict | None = None
-    # Reasoning/thinking mode control (OpenAI-compatible)
-    # "none" = disable thinking, "low"/"medium"/"high" = enable thinking
-    # None = use server default
-    reasoning_effort: str | None = None
-    # Thinking budget: max tokens for thinking before forcing </think>
-    thinking_budget: int | None = None
+    # OpenAI-compatible token bias map: token id string -> bias value
+    logit_bias: dict[str, float] | None = None
+    # Extra kwargs forwarded to tokenizer.apply_chat_template
+    chat_template_kwargs: dict[str, Any] | None = None
     # MLLM-specific parameters
     video_fps: float | None = None
     video_max_frames: int | None = None
+    # Sampling penalties
+    repetition_penalty: float | None = None  # mlx-lm style (>1.0 penalizes)
     # Request timeout in seconds (None = use server default)
     timeout: float | None = None
     # SpecPrefill: per-request enable/disable (None = server decides)
     specprefill: bool | None = None
     # SpecPrefill: per-request keep percentage (0.0-1.0, None = use server default)
     specprefill_keep_pct: float | None = None
+    # SpecPrefill: per-request evenly spaced backbone percentage.
+    specprefill_backbone_pct: float | None = None
+    # Enable/disable thinking mode (None = server default, typically True)
+    enable_thinking: bool | None = None
+    # MLLM assistant-drafter path: opt in to using a configured drafter.
+    # Text-only requests also use this flag to leave the default TextModel route
+    # and run through the MLLM path where the drafter can participate.
+    mllm_draft: bool | None = None
+    # Thinking token budget: cap reasoning tokens by forcing </think> when
+    # budget exhausted (None = no budget, unlimited reasoning)
+    thinking_token_budget: int | None = Field(default=None, gt=0)
 
 
 class AssistantMessage(BaseModel):
@@ -191,16 +219,29 @@ class AssistantMessage(BaseModel):
 
     role: str = "assistant"
     content: str | None = None
-    reasoning: str | None = (
-        None  # Reasoning/thinking content (when --reasoning-parser is used)
+    reasoning_content: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("reasoning_content", "reasoning"),
     )
     tool_calls: list[ToolCall] | None = None
 
-    @computed_field
     @property
-    def reasoning_content(self) -> str | None:
-        """Alias for reasoning field. Serialized for backwards compatibility with clients expecting reasoning_content."""
-        return self.reasoning
+    def reasoning(self) -> str | None:
+        return self.reasoning_content
+
+    @model_serializer
+    def _serialize(self) -> dict:
+        """Serialize with OpenAI-compatible schema.
+
+        - ``tool_calls`` and ``reasoning_content`` are omitted when None.
+        - ``content`` is always included (even as null) per OpenAI spec.
+        """
+        d: dict = {"role": self.role, "content": self.content}
+        if self.reasoning_content is not None:
+            d["reasoning_content"] = self.reasoning_content
+        if self.tool_calls is not None:
+            d["tool_calls"] = [tc.model_dump() for tc in self.tool_calls]
+        return d
 
 
 class ChatCompletionChoice(BaseModel):
@@ -219,6 +260,13 @@ class Usage(BaseModel):
     total_tokens: int = 0
 
 
+class GenerationMetadata(BaseModel):
+    """Optional generation diagnostics emitted for feature-bearing requests."""
+
+    no_final_content_watchdog_tokens: int | None = None
+    no_final_content_watchdog_enforced: bool = False
+
+
 class ChatCompletionResponse(BaseModel):
     """Response for chat completion."""
 
@@ -228,6 +276,7 @@ class ChatCompletionResponse(BaseModel):
     model: str
     choices: list[ChatCompletionChoice]
     usage: Usage = Field(default_factory=Usage)
+    generation_metadata: GenerationMetadata | None = None
 
 
 # =============================================================================
@@ -242,11 +291,22 @@ class CompletionRequest(BaseModel):
     prompt: str | list[str]
     temperature: float | None = None
     top_p: float | None = None
-    max_tokens: int | None = None
+    top_k: int | None = None
+    min_p: float | None = None
+    presence_penalty: float | None = None
+    max_tokens: int | None = Field(default=None, gt=0)
     stream: bool = False
     stop: list[str] | None = None
+    # Sampling penalties
+    repetition_penalty: float | None = None  # mlx-lm style (>1.0 penalizes)
     # Request timeout in seconds (None = use server default)
     timeout: float | None = None
+    # SpecPrefill: per-request enable/disable (None = server decides)
+    specprefill: bool | None = None
+    # SpecPrefill: per-request keep percentage (0.0-1.0, None = use server default)
+    specprefill_keep_pct: float | None = None
+    # SpecPrefill: per-request evenly spaced backbone percentage.
+    specprefill_backbone_pct: float | None = None
 
 
 class CompletionChoice(BaseModel):
@@ -421,6 +481,43 @@ class EmbeddingResponse(BaseModel):
 
 
 # =============================================================================
+# Reranking
+# =============================================================================
+
+
+class RerankRequest(BaseModel):
+    """Request for reranking documents against a query (Jina/Cohere convention)."""
+
+    model: str
+    query: str
+    documents: list[str | dict]
+    top_n: int | None = None
+    return_documents: bool = True
+
+
+class RerankResult(BaseModel):
+    """A single reranked document result."""
+
+    index: int
+    relevance_score: float
+    document: dict | None = None
+
+
+class RerankUsage(BaseModel):
+    """Token usage for rerank requests."""
+
+    total_tokens: int = 0
+
+
+class RerankResponse(BaseModel):
+    """Response for reranking endpoint (Jina/Cohere convention)."""
+
+    model: str
+    results: list[RerankResult]
+    usage: RerankUsage = Field(default_factory=RerankUsage)
+
+
+# =============================================================================
 # Streaming (for SSE responses)
 # =============================================================================
 
@@ -430,16 +527,33 @@ class ChatCompletionChunkDelta(BaseModel):
 
     role: str | None = None
     content: str | None = None
-    reasoning: str | None = (
-        None  # Reasoning/thinking content (when --reasoning-parser is used)
+    reasoning_content: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("reasoning_content", "reasoning"),
     )
     tool_calls: list[dict] | None = None
 
-    @computed_field
     @property
-    def reasoning_content(self) -> str | None:
-        """Alias for reasoning field. Serialized for backwards compatibility with clients expecting reasoning_content."""
-        return self.reasoning
+    def reasoning(self) -> str | None:
+        return self.reasoning_content
+
+    @model_serializer
+    def _serialize(self) -> dict:
+        """Serialize delta with only non-None fields.
+
+        Per OpenAI streaming spec, delta objects only include fields that
+        carry new content.
+        """
+        d: dict = {}
+        if self.role is not None:
+            d["role"] = self.role
+        if self.content is not None:
+            d["content"] = self.content
+        if self.reasoning_content is not None:
+            d["reasoning_content"] = self.reasoning_content
+        if self.tool_calls is not None:
+            d["tool_calls"] = self.tool_calls
+        return d
 
 
 class ChatCompletionChunkChoice(BaseModel):

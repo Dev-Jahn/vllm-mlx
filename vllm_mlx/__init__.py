@@ -12,7 +12,7 @@ Features:
 - Support for LLM and multimodal models
 """
 
-__version__ = "0.2.5"
+__version__ = "0.4.1"
 
 # All imports are lazy to allow usage on non-Apple Silicon platforms
 # (e.g., CI running on Linux) where mlx_lm is not available.
@@ -71,7 +71,7 @@ def __getattr__(name):
 
     # vLLM integration components (require torch)
     if name == "MLXPlatform":
-        from vllm_mlx.platform import MLXPlatform
+        from vllm_mlx.vllm_platform import MLXPlatform
 
         return MLXPlatform
     if name == "MLXWorker":

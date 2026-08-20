@@ -6,11 +6,16 @@ Tests clean_output_text, is_mllm_model, and extract_multimodal_content
 from vllm_mlx/api/utils.py. No MLX dependency.
 """
 
+import json
+
 from vllm_mlx.api.models import ContentPart, ImageUrl, Message
 from vllm_mlx.api.utils import (
     MLLM_PATTERNS,
     SPECIAL_TOKENS_PATTERN,
+    _check_legacy_string_patterns,
+    _config_indicates_vlm,
     _content_to_text,
+    _try_read_config_json,
     clean_output_text,
     extract_multimodal_content,
     is_mllm_model,
@@ -92,6 +97,24 @@ class TestCleanOutputText:
         assert "</think>" in result
         assert "42" in result
         assert "<|im_start|>" not in result
+
+    def test_gpt_oss_commentary_final_returns_final_text(self):
+        text = (
+            "<|channel|>commentary to=functions.get_weather"
+            '<|message|>{"loc": "SF"}'
+            "<|channel|>final<|message|>Done<|return|>"
+        )
+        assert clean_output_text(text) == "Done"
+        assert "<|channel|>" not in clean_output_text(text)
+        assert "<|message|>" not in clean_output_text(text)
+
+    def test_gpt_oss_commentary_call_returns_args_json(self):
+        text = (
+            "<|channel|>commentary to=functions.get_weather"
+            '<|message|>{"loc": "SF"}<|call|>'
+        )
+        assert clean_output_text(text) == '{"loc": "SF"}'
+        assert "<|call|>" not in clean_output_text(text)
 
 
 class TestSpecialTokensPattern:
@@ -193,6 +216,110 @@ class TestIsMllmModel:
         assert len(MLLM_PATTERNS) > 20
 
 
+class TestIsMllmModelConfigPriority:
+    """Tests that config.json takes priority over the legacy substring matcher.
+
+    Regression coverage for issue #516: a local path with a triggering
+    substring (e.g. "vl-") used to be misrouted to the MLLM loader even when
+    the model itself was text-only. With config.json inspection in front,
+    the model's own metadata wins.
+    """
+
+    @staticmethod
+    def _write_config(tmp_path, name, payload):
+        model_dir = tmp_path / name
+        model_dir.mkdir()
+        (model_dir / "config.json").write_text(json.dumps(payload))
+        return model_dir
+
+    def test_text_only_config_overrides_triggering_path(self, tmp_path):
+        # Path basename contains "vl-" which would match the legacy pattern,
+        # but the model declares itself as text-only via config.json.
+        model_dir = self._write_config(
+            tmp_path,
+            "qwen3-vl-derived",
+            {"model_type": "qwen3", "architectures": ["Qwen3ForCausalLM"]},
+        )
+        assert _check_legacy_string_patterns(str(model_dir)) is True
+        assert is_mllm_model(str(model_dir)) is False
+
+    def test_vlm_config_under_neutral_path(self, tmp_path):
+        model_dir = self._write_config(
+            tmp_path,
+            "my-model",
+            {
+                "model_type": "qwen2_vl",
+                "architectures": ["Qwen2VLForConditionalGeneration"],
+            },
+        )
+        assert _check_legacy_string_patterns(str(model_dir)) is False
+        assert is_mllm_model(str(model_dir)) is True
+
+    def test_vision_config_key_indicates_vlm(self, tmp_path):
+        model_dir = self._write_config(
+            tmp_path,
+            "exotic-vlm",
+            {"model_type": "custom", "vision_config": {"hidden_size": 768}},
+        )
+        assert is_mllm_model(str(model_dir)) is True
+
+    def test_audio_config_key_indicates_vlm(self, tmp_path):
+        model_dir = self._write_config(
+            tmp_path,
+            "audio-model",
+            {"model_type": "custom_audio", "audio_config": {"sample_rate": 16000}},
+        )
+        assert is_mllm_model(str(model_dir)) is True
+
+    def test_missing_config_falls_back_to_string_matcher(self, tmp_path):
+        # No config.json present, so detection falls back to the legacy
+        # matcher against the input string.
+        model_dir = tmp_path / "Qwen3-VL-7B"
+        model_dir.mkdir()
+        assert is_mllm_model(str(model_dir)) is True
+
+    def test_malformed_config_falls_back_gracefully(self, tmp_path):
+        model_dir = tmp_path / "broken-vl-model"
+        model_dir.mkdir()
+        (model_dir / "config.json").write_text("{not valid json")
+        # Falls back to legacy matcher; basename has "vl-" → True.
+        assert is_mllm_model(str(model_dir)) is True
+
+    def test_oversized_config_falls_back_gracefully(self, tmp_path):
+        model_dir = tmp_path / "huge-config-vl-model"
+        model_dir.mkdir()
+        # 2 MB of payload exceeds the 1 MB cap.
+        (model_dir / "config.json").write_text("x" * (2 * 1024 * 1024))
+        assert is_mllm_model(str(model_dir)) is True
+
+    def test_hf_repo_id_uses_legacy_matcher(self):
+        # HF repo IDs are not local dirs, so config inspection short-circuits
+        # and the legacy matcher decides. This preserves prior behaviour.
+        assert is_mllm_model("Qwen/Qwen3-32B") is False
+        assert is_mllm_model("mlx-community/Qwen3-VL-4B-Instruct-3bit") is True
+
+    def test_try_read_config_json_returns_none_for_repo_id(self):
+        assert _try_read_config_json("Qwen/Qwen3-32B") is None
+
+    def test_try_read_config_json_returns_none_for_missing_dir(self, tmp_path):
+        assert _try_read_config_json(str(tmp_path / "does-not-exist")) is None
+
+    def test_config_indicates_vlm_recognises_llava(self):
+        assert (
+            _config_indicates_vlm({"architectures": ["LlavaForConditionalGeneration"]})
+            is True
+        )
+
+    def test_config_indicates_vlm_rejects_text_only_qwen3(self):
+        assert _config_indicates_vlm({"architectures": ["Qwen3ForCausalLM"]}) is False
+
+    def test_config_indicates_vlm_handles_missing_architectures(self):
+        assert _config_indicates_vlm({"model_type": "qwen3"}) is False
+
+    def test_config_indicates_vlm_handles_non_list_architectures(self):
+        assert _config_indicates_vlm({"architectures": "Qwen3ForCausalLM"}) is False
+
+
 class TestExtractMultimodalContent:
     """Tests for extract_multimodal_content function."""
 
@@ -201,17 +328,18 @@ class TestExtractMultimodalContent:
             Message(role="system", content="You are helpful."),
             Message(role="user", content="Hello"),
         ]
-        processed, images, videos = extract_multimodal_content(messages)
+        processed, images, videos, audios = extract_multimodal_content(messages)
 
         assert len(processed) == 2
         assert processed[0] == {"role": "system", "content": "You are helpful."}
         assert processed[1] == {"role": "user", "content": "Hello"}
         assert images == []
         assert videos == []
+        assert audios == []
 
     def test_none_content(self):
         messages = [Message(role="assistant", content=None)]
-        processed, images, videos = extract_multimodal_content(messages)
+        processed, images, videos, _ = extract_multimodal_content(messages)
         assert processed[0] == {"role": "assistant", "content": ""}
 
     def test_multimodal_with_image_url(self):
@@ -227,12 +355,13 @@ class TestExtractMultimodalContent:
                 ],
             )
         ]
-        processed, images, videos = extract_multimodal_content(messages)
+        processed, images, videos, audios = extract_multimodal_content(messages)
 
         assert len(processed) == 1
         assert processed[0]["content"] == "What is this?"
         assert images == ["https://example.com/img.png"]
         assert videos == []
+        assert audios == []
 
     def test_multimodal_with_dict_image_url(self):
         messages = [
@@ -247,7 +376,7 @@ class TestExtractMultimodalContent:
                 ],
             )
         ]
-        processed, images, videos = extract_multimodal_content(messages)
+        processed, images, videos, _ = extract_multimodal_content(messages)
         assert images == ["data:image/png;base64,abc"]
 
     def test_multimodal_with_string_image_url(self):
@@ -260,7 +389,7 @@ class TestExtractMultimodalContent:
                 ],
             )
         ]
-        processed, images, videos = extract_multimodal_content(messages)
+        processed, images, videos, _ = extract_multimodal_content(messages)
         assert images == ["https://example.com/img.png"]
 
     def test_multimodal_with_video(self):
@@ -273,7 +402,7 @@ class TestExtractMultimodalContent:
                 ],
             )
         ]
-        processed, images, videos = extract_multimodal_content(messages)
+        processed, images, videos, _ = extract_multimodal_content(messages)
         assert videos == ["/path/to/video.mp4"]
 
     def test_multimodal_with_video_url(self):
@@ -289,7 +418,7 @@ class TestExtractMultimodalContent:
                 ],
             )
         ]
-        processed, images, videos = extract_multimodal_content(messages)
+        processed, images, videos, _ = extract_multimodal_content(messages)
         assert videos == ["https://example.com/v.mp4"]
 
     def test_multimodal_with_string_video_url(self):
@@ -302,8 +431,49 @@ class TestExtractMultimodalContent:
                 ],
             )
         ]
-        processed, images, videos = extract_multimodal_content(messages)
+        processed, images, videos, _ = extract_multimodal_content(messages)
         assert videos == ["https://example.com/v.mp4"]
+
+    def test_multimodal_with_audio_url(self):
+        messages = [
+            Message(
+                role="user",
+                content=[
+                    {"type": "text", "text": "Transcribe this"},
+                    {
+                        "type": "audio_url",
+                        "audio_url": {"url": "data:audio/wav;base64,abc"},
+                    },
+                ],
+            )
+        ]
+        processed, images, videos, audios = extract_multimodal_content(messages)
+        assert processed[0]["content"] == "Transcribe this"
+        assert images == []
+        assert videos == []
+        assert audios == ["data:audio/wav;base64,abc"]
+
+    def test_multimodal_with_audio_type(self):
+        raw_messages = [
+            type(
+                "Msg",
+                (),
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "Listen"},
+                        {"type": "audio", "audio": "/tmp/example.wav"},
+                    ],
+                    "tool_calls": None,
+                    "tool_call_id": None,
+                },
+            )()
+        ]
+        processed, images, videos, audios = extract_multimodal_content(raw_messages)
+        assert processed[0]["content"] == "Listen"
+        assert images == []
+        assert videos == []
+        assert audios == ["/tmp/example.wav"]
 
     def test_multiple_images(self):
         messages = [
@@ -316,14 +486,14 @@ class TestExtractMultimodalContent:
                 ],
             )
         ]
-        processed, images, videos = extract_multimodal_content(messages)
+        processed, images, videos, _ = extract_multimodal_content(messages)
         assert len(images) == 2
 
     def test_tool_response_message(self):
         messages = [
             Message(role="tool", content="72F and sunny", tool_call_id="call_1")
         ]
-        processed, images, videos = extract_multimodal_content(messages)
+        processed, images, videos, _ = extract_multimodal_content(messages)
         assert processed[0]["role"] == "user"
         assert "Tool Result" in processed[0]["content"]
         assert "call_1" in processed[0]["content"]
@@ -332,7 +502,7 @@ class TestExtractMultimodalContent:
         messages = [
             Message(role="tool", content="72F and sunny", tool_call_id="call_1")
         ]
-        processed, images, videos = extract_multimodal_content(
+        processed, images, videos, _ = extract_multimodal_content(
             messages, preserve_native_format=True
         )
         assert processed[0]["role"] == "tool"
@@ -356,7 +526,7 @@ class TestExtractMultimodalContent:
                 ],
             )
         ]
-        processed, images, videos = extract_multimodal_content(messages)
+        processed, images, videos, _ = extract_multimodal_content(messages)
         assert processed[0]["role"] == "assistant"
         assert "get_weather" in processed[0]["content"]
 
@@ -377,7 +547,7 @@ class TestExtractMultimodalContent:
                 ],
             )
         ]
-        processed, images, videos = extract_multimodal_content(
+        processed, images, videos, _ = extract_multimodal_content(
             messages, preserve_native_format=True
         )
         assert processed[0]["role"] == "assistant"
@@ -390,7 +560,7 @@ class TestExtractMultimodalContent:
             Message(role="user", content="Hello"),
         ]
         # Also test with raw dicts (the function handles both)
-        processed, images, videos = extract_multimodal_content(messages)
+        processed, images, videos, _ = extract_multimodal_content(messages)
         assert processed[0]["content"] == "Hello"
 
     def test_image_type_content_with_raw_dicts(self):
@@ -411,18 +581,19 @@ class TestExtractMultimodalContent:
                 },
             )()
         ]
-        processed, images, videos = extract_multimodal_content(raw_messages)
+        processed, images, videos, _ = extract_multimodal_content(raw_messages)
         assert images == ["https://example.com/img.png"]
 
     def test_empty_messages(self):
-        processed, images, videos = extract_multimodal_content([])
+        processed, images, videos, audios = extract_multimodal_content([])
         assert processed == []
         assert images == []
         assert videos == []
+        assert audios == []
 
     def test_tool_response_none_content(self):
         messages = [Message(role="tool", content=None, tool_call_id="call_1")]
-        processed, images, videos = extract_multimodal_content(messages)
+        processed, images, videos, _ = extract_multimodal_content(messages)
         assert processed[0]["role"] == "user"
         assert "call_1" in processed[0]["content"]
 
@@ -436,7 +607,7 @@ class TestExtractMultimodalContent:
                 ],
             )
         ]
-        processed, images, videos = extract_multimodal_content(messages)
+        processed, images, videos, _ = extract_multimodal_content(messages)
         assert "First part." in processed[0]["content"]
         assert "Second part." in processed[0]["content"]
 
@@ -458,7 +629,7 @@ class TestExtractMultimodalContent:
                 ],
             )
         ]
-        result, images, videos = extract_multimodal_content(messages)
+        result, images, videos, _ = extract_multimodal_content(messages)
         assert isinstance(result[0]["content"], str)
         assert "Let me check." in result[0]["content"]
         assert "get_weather" in result[0]["content"]
@@ -481,7 +652,7 @@ class TestExtractMultimodalContent:
                 ],
             )
         ]
-        result, images, videos = extract_multimodal_content(
+        result, images, videos, _ = extract_multimodal_content(
             messages, preserve_native_format=True
         )
         assert isinstance(result[0]["content"], str)

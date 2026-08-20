@@ -1,0 +1,437 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Tests for chat template kwargs forwarding."""
+
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
+
+import pytest
+from fastapi.testclient import TestClient
+
+import vllm_mlx.server as srv
+from vllm_mlx.engine.base import GenerationOutput
+
+
+@pytest.fixture
+def anyio_backend():
+    return "asyncio"
+
+
+def test_chat_completion_request_preserves_chat_template_kwargs():
+    request = srv.ChatCompletionRequest(
+        model="test-model",
+        messages=[srv.Message(role="user", content="Hello")],
+        chat_template_kwargs={"enable_thinking": False},
+    )
+
+    assert request.chat_template_kwargs == {"enable_thinking": False}
+
+
+def test_batched_engine_applies_chat_template_kwargs():
+    with patch("vllm_mlx.engine.batched.is_mllm_model", return_value=False):
+        from vllm_mlx.engine.batched import BatchedEngine
+
+        engine = BatchedEngine("test-model")
+        engine._tokenizer = MagicMock()
+        engine._tokenizer.apply_chat_template.return_value = "prompt"
+
+        prompt = engine._apply_chat_template(
+            [{"role": "user", "content": "Hello"}],
+            chat_template_kwargs={"enable_thinking": False},
+        )
+
+        assert prompt == "prompt"
+        engine._tokenizer.apply_chat_template.assert_called_once()
+        assert (
+            engine._tokenizer.apply_chat_template.call_args.kwargs["enable_thinking"]
+            is False
+        )
+
+
+def test_batched_engine_mllm_falls_back_to_tokenizer_when_processor_has_no_template():
+    with patch("vllm_mlx.engine.batched.is_mllm_model", return_value=True):
+        from vllm_mlx.engine.batched import BatchedEngine
+
+        engine = BatchedEngine("test-mllm-model")
+        engine._is_mllm = True
+
+        tokenizer = MagicMock()
+        tokenizer.apply_chat_template.return_value = "prompt-from-tokenizer"
+
+        processor = MagicMock()
+        processor.tokenizer = tokenizer
+        processor.apply_chat_template.side_effect = ValueError(
+            "Cannot use apply_chat_template because this processor does not have a chat template."
+        )
+        engine._processor = processor
+
+        prompt = engine._apply_chat_template(
+            [{"role": "user", "content": "Hello"}],
+            chat_template_kwargs={"enable_thinking": False},
+        )
+
+        assert prompt == "prompt-from-tokenizer"
+        processor.apply_chat_template.assert_called_once()
+        tokenizer.apply_chat_template.assert_called_once()
+
+
+def test_chat_completion_endpoint_forwards_chat_template_kwargs():
+    captured = {}
+
+    class FakeEngine:
+        model_name = "test-model"
+        is_mllm = False
+        preserve_native_tool_format = False
+
+        async def chat(self, messages, **kwargs):
+            captured["messages"] = messages
+            captured["kwargs"] = kwargs
+            return GenerationOutput(
+                text="ORBIT",
+                prompt_tokens=4,
+                completion_tokens=1,
+                finish_reason="stop",
+            )
+
+    client = TestClient(srv.app)
+    original_engine = srv._engine
+    original_model_name = srv._model_name
+    srv._engine = FakeEngine()
+    srv._model_name = "test-model"
+    try:
+        response = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "Reply with ORBIT."}],
+                "max_tokens": 8,
+                "chat_template_kwargs": {"enable_thinking": False},
+            },
+        )
+    finally:
+        srv._engine = original_engine
+        srv._model_name = original_model_name
+
+    assert response.status_code == 200
+    assert captured["kwargs"]["chat_template_kwargs"] == {"enable_thinking": False}
+    assert response.json()["choices"][0]["message"]["content"] == "ORBIT"
+
+
+def test_chat_completion_endpoint_applies_server_default_chat_template_kwargs():
+    captured = {}
+
+    class FakeEngine:
+        model_name = "test-model"
+        is_mllm = False
+        preserve_native_tool_format = False
+
+        async def chat(self, messages, **kwargs):
+            captured["messages"] = messages
+            captured["kwargs"] = kwargs
+            return GenerationOutput(
+                text="ORBIT",
+                prompt_tokens=4,
+                completion_tokens=1,
+                finish_reason="stop",
+            )
+
+    client = TestClient(srv.app)
+    original_engine = srv._engine
+    original_model_name = srv._model_name
+    original_defaults = getattr(srv, "_default_chat_template_kwargs", None)
+    srv._engine = FakeEngine()
+    srv._model_name = "test-model"
+    srv._default_chat_template_kwargs = {"enable_thinking": False}
+    try:
+        response = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "Reply with ORBIT."}],
+                "max_tokens": 8,
+            },
+        )
+    finally:
+        srv._engine = original_engine
+        srv._model_name = original_model_name
+        srv._default_chat_template_kwargs = original_defaults
+
+    assert response.status_code == 200
+    assert captured["kwargs"]["chat_template_kwargs"] == {"enable_thinking": False}
+    assert response.json()["choices"][0]["message"]["content"] == "ORBIT"
+
+
+def test_chat_completion_endpoint_request_kwargs_override_server_defaults():
+    captured = {}
+
+    class FakeEngine:
+        model_name = "test-model"
+        is_mllm = False
+        preserve_native_tool_format = False
+
+        async def chat(self, messages, **kwargs):
+            captured["messages"] = messages
+            captured["kwargs"] = kwargs
+            return GenerationOutput(
+                text="ORBIT",
+                prompt_tokens=4,
+                completion_tokens=1,
+                finish_reason="stop",
+            )
+
+    client = TestClient(srv.app)
+    original_engine = srv._engine
+    original_model_name = srv._model_name
+    original_defaults = getattr(srv, "_default_chat_template_kwargs", None)
+    srv._engine = FakeEngine()
+    srv._model_name = "test-model"
+    srv._default_chat_template_kwargs = {
+        "enable_thinking": False,
+        "server_default_only": "yes",
+    }
+    try:
+        response = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "Reply with ORBIT."}],
+                "max_tokens": 8,
+                "chat_template_kwargs": {
+                    "enable_thinking": True,
+                    "request_only": 1,
+                },
+            },
+        )
+    finally:
+        srv._engine = original_engine
+        srv._model_name = original_model_name
+        srv._default_chat_template_kwargs = original_defaults
+
+    assert response.status_code == 200
+    assert captured["kwargs"]["chat_template_kwargs"] == {
+        "enable_thinking": True,
+        "server_default_only": "yes",
+        "request_only": 1,
+    }
+    assert response.json()["choices"][0]["message"]["content"] == "ORBIT"
+
+
+def test_llm_chat_applies_chat_template_kwargs_before_generate():
+    from vllm_mlx.models.llm import MLXLanguageModel
+
+    model = MLXLanguageModel.__new__(MLXLanguageModel)
+    model._loaded = True
+    model.tokenizer = MagicMock()
+    model.tokenizer.apply_chat_template.return_value = "prompt"
+    model.generate = MagicMock(return_value="ok")
+
+    result = model.chat(
+        [{"role": "user", "content": "Hello"}],
+        chat_template_kwargs={"enable_thinking": False},
+    )
+
+    assert result == "ok"
+    model.tokenizer.apply_chat_template.assert_called_once()
+    assert (
+        model.tokenizer.apply_chat_template.call_args.kwargs["enable_thinking"] is False
+    )
+    model.generate.assert_called_once()
+
+
+@pytest.mark.anyio
+async def test_simple_engine_mllm_chat_forwards_chat_template_kwargs():
+    from vllm_mlx.engine.simple import SimpleEngine
+
+    with patch("vllm_mlx.engine.simple.is_mllm_model", return_value=True):
+        engine = SimpleEngine("test-model")
+        engine._loaded = True
+        engine._is_mllm = True
+        engine._text_model = None
+        engine._model = MagicMock()
+        engine._model.stream_chat = MagicMock(
+            return_value=iter(
+                [
+                    SimpleNamespace(
+                        text="OK",
+                        prompt_tokens=5,
+                        finish_reason="stop",
+                    )
+                ]
+            )
+        )
+
+        output = await engine.chat(
+            [{"role": "user", "content": "Hello"}],
+            chat_template_kwargs={"enable_thinking": False},
+        )
+
+        assert output.text == "OK"
+        assert engine._model.stream_chat.call_args.kwargs["chat_template_kwargs"] == {
+            "enable_thinking": False
+        }
+        # Text-only MLLM non-stream chat now aggregates the streaming path.
+        assert engine._model.chat.call_count == 0
+
+
+@pytest.mark.anyio
+async def test_simple_engine_stream_generate_text_applies_chat_template_kwargs():
+    from vllm_mlx.engine.simple import SimpleEngine
+
+    with patch("vllm_mlx.engine.simple.is_mllm_model", return_value=True):
+        engine = SimpleEngine("test-model")
+        engine._loaded = True
+        engine._is_mllm = True
+        engine._text_tokenizer = MagicMock()
+        engine._text_tokenizer.apply_chat_template.return_value = "prompt"
+        engine._text_model = MagicMock()
+        engine._text_model.model = MagicMock()
+
+        with (
+            patch("mlx_lm.stream_generate", return_value=iter(())),
+            patch("mlx_lm.models.cache.make_prompt_cache", return_value=[]),
+            patch("mlx_lm.sample_utils.make_sampler", return_value=object()),
+        ):
+            chunks = [
+                chunk
+                async for chunk in engine._stream_generate_text(
+                    [{"role": "user", "content": "Hello"}],
+                    max_tokens=8,
+                    temperature=0.7,
+                    top_p=0.9,
+                    chat_template_kwargs={"enable_thinking": False},
+                )
+            ]
+
+        assert chunks
+        engine._text_tokenizer.apply_chat_template.assert_called_once()
+        assert (
+            engine._text_tokenizer.apply_chat_template.call_args.kwargs[
+                "enable_thinking"
+            ]
+            is False
+        )
+
+
+# Regression tests for the reasoning-parser bypass when enable_thinking=False.
+# Server started with --default-chat-template-kwargs '{"enable_thinking": false}'
+# plus a Qwen3 reasoning parser used to route every token into a `thinking`
+# block and leave `text` empty, so Claude Code saw `result: ""`.
+
+
+@pytest.mark.parametrize(
+    "enable_thinking, ctk, expected",
+    [
+        (None, None, False),  # nothing set
+        (False, None, True),  # request-level flag
+        (None, {"enable_thinking": False}, True),  # server default surface
+        (True, {"enable_thinking": True}, False),  # explicit True
+        (None, {}, False),  # empty kwargs
+    ],
+)
+def test_thinking_disabled_helper(enable_thinking, ctk, expected):
+    request = SimpleNamespace(enable_thinking=enable_thinking)
+    chat_kwargs = {"chat_template_kwargs": ctk} if ctk is not None else {}
+    assert srv._thinking_disabled(request, chat_kwargs) is expected
+
+
+@pytest.mark.anyio
+async def test_stream_chat_does_not_add_nemotron_prefix_when_thinking_disabled(
+    monkeypatch,
+):
+    class FakeReasoningParser:
+        def __init__(self, tokenizer=None):
+            self.tokenizer = tokenizer
+
+        def reset_state(self):
+            pass
+
+        def extract_reasoning_streaming(self, previous_text, current_text, delta_text):
+            raise AssertionError("disabled reasoning parser should not consume deltas")
+
+    class FakeEngine:
+        model_name = "Nemotron-test"
+        tokenizer = object()
+
+        async def stream_chat(self, messages, **kwargs):
+            yield GenerationOutput(
+                text="plain answer",
+                new_text="plain answer",
+                finished=True,
+                finish_reason="stop",
+                prompt_tokens=4,
+                completion_tokens=2,
+            )
+
+    monkeypatch.setattr(srv, "_model_name", "test-model")
+    monkeypatch.setattr(srv, "_reasoning_parser_name", "fake")
+    monkeypatch.setattr(srv, "_reasoning_parser", FakeReasoningParser())
+    monkeypatch.setattr(srv, "get_reasoning_parser", lambda _name: FakeReasoningParser)
+    monkeypatch.setattr(srv, "_enable_auto_tool_choice", False)
+    monkeypatch.setattr(srv, "_tool_call_parser", None)
+
+    request = srv.ChatCompletionRequest(
+        model="test-model",
+        messages=[srv.Message(role="user", content="Hello")],
+        stream=True,
+        enable_thinking=False,
+    )
+    chunks = [
+        chunk
+        async for chunk in srv.stream_chat_completion(
+            FakeEngine(), request.messages, request
+        )
+    ]
+
+    body = "".join(chunks)
+    assert "plain answer" in body
+    assert "<think>" not in body
+
+
+@pytest.mark.anyio
+async def test_stream_anthropic_skips_reasoning_parser_when_thinking_disabled():
+    from vllm_mlx.reasoning import DeltaMessage
+
+    class _EatsEverythingAsReasoning:
+        # Mimics BaseThinkingReasoningParser's implicit-mode default.
+        def reset_state(self):
+            pass
+
+        def extract_reasoning_streaming(self, prev, cur, delta):
+            return DeltaMessage(reasoning=delta)
+
+    async def fake_stream_chat(messages, **kwargs):
+        for piece in ("HEL", "LO"):
+            yield SimpleNamespace(new_text=piece, prompt_tokens=4, completion_tokens=1)
+
+    engine = MagicMock(stream_chat=fake_stream_chat)
+    msgs = [{"role": "user", "content": "Say HELLO"}]
+    openai_request = srv.ChatCompletionRequest(
+        model="test-model", messages=[srv.Message(**msgs[0])], max_tokens=8
+    )
+    anthropic_request = srv.AnthropicRequest(
+        model="test-model", max_tokens=8, messages=msgs
+    )
+    prepared = srv.PreparedChatInvocation(
+        messages=msgs,
+        chat_kwargs={"chat_template_kwargs": {"enable_thinking": False}},
+        response_format=None,
+        json_logits_processor=None,
+    )
+
+    saved = (srv._reasoning_parser, srv._model_name)
+    srv._reasoning_parser, srv._model_name = _EatsEverythingAsReasoning(), "test-model"
+    try:
+        body = "".join(
+            [
+                c
+                async for c in srv._stream_anthropic_messages(
+                    engine, openai_request, anthropic_request, prepared
+                )
+            ]
+        )
+    finally:
+        srv._reasoning_parser, srv._model_name = saved
+
+    assert "thinking_delta" not in body  # would fire on broken path
+    assert '"type": "thinking"' not in body
+    assert "HEL" in body and "LO" in body
+    assert '"type": "text_delta"' in body

@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for memory-aware prefix cache."""
 
+import threading
+import time
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -25,6 +27,7 @@ class TestMemoryCacheConfig:
         assert config.max_memory_percent == 0.20
         assert config.max_entries == 1000
         assert config.enable_memory_tracking is True
+        assert config.min_prefix_tokens == 128
 
     def test_custom_config(self):
         config = MemoryCacheConfig(
@@ -51,6 +54,10 @@ class TestMemoryCacheConfig:
     def test_invalid_max_entries(self):
         with pytest.raises(ValueError, match="max_entries"):
             MemoryCacheConfig(max_entries=0)
+
+    def test_invalid_min_prefix_tokens(self):
+        with pytest.raises(ValueError, match="min_prefix_tokens"):
+            MemoryCacheConfig(min_prefix_tokens=0)
 
     def test_compute_memory_limit_explicit(self):
         config = MemoryCacheConfig(max_memory_mb=1024)
@@ -191,6 +198,36 @@ class TestArrayMemory:
         expected = 2 * (1 * 8 * 100 * 64 * 2)
         assert estimate_kv_cache_memory([layer]) == expected
 
+    def test_estimate_handles_nested_cachelist_state(self):
+        """Regression: DeepSeek-V4's CacheList.state nests three sub-states.
+
+        The old two-way unpack raised ValueError, was swallowed, and the whole
+        entry counted as 0 bytes — so the dashboard's Prefix Cache bar stayed
+        at 0% and byte-based LRU eviction never fired for such models.
+        """
+
+        class NestedStateCache:
+            def __init__(self):
+                rot = (
+                    MockShapeArray(shape=(1, 8, 128, 64), dtype_size=2),
+                    MockShapeArray(shape=(1, 8, 128, 64), dtype_size=2),
+                )
+                pool_a = (
+                    MockShapeArray(shape=(1, 3, 512), dtype_size=2),
+                    MockShapeArray(shape=(1, 3, 128), dtype_size=2),
+                    MockShapeArray(shape=(1, 40, 512), dtype_size=2),
+                )
+                pool_b = (None, None, None)  # empty PoolingCache members
+                self.state = [rot, pool_a, pool_b]
+
+        expected = (
+            2 * (1 * 8 * 128 * 64 * 2)
+            + (1 * 3 * 512 * 2)
+            + (1 * 3 * 128 * 2)
+            + (1 * 40 * 512 * 2)
+        )
+        assert estimate_kv_cache_memory([NestedStateCache()]) == expected
+
 
 class TestEstimateKvCacheMemory:
     """Tests for estimate_kv_cache_memory function."""
@@ -239,7 +276,11 @@ class TestMemoryAwarePrefixCache:
     @pytest.fixture
     def small_cache(self, model):
         """Cache with 1MB limit."""
-        config = MemoryCacheConfig(max_memory_mb=1, max_entries=10)
+        config = MemoryCacheConfig(
+            max_memory_mb=1,
+            max_entries=10,
+            min_prefix_tokens=1,
+        )
         return MemoryAwarePrefixCache(model, config)
 
     @pytest.fixture
@@ -270,6 +311,26 @@ class TestMemoryAwarePrefixCache:
         assert result is kv  # Same reference, no copy
         assert remaining == []
 
+    def test_short_prefix_reuse_is_rejected(self, model, mock_kv_cache):
+        cache = MemoryAwarePrefixCache(
+            model,
+            MemoryCacheConfig(
+                max_memory_mb=10,
+                max_entries=10,
+                min_prefix_tokens=8,
+            ),
+        )
+        short_tokens = [1, 2, 3, 4, 5]
+        kv = mock_kv_cache(1000)
+
+        assert cache.store(short_tokens, kv) is False
+        assert len(cache) == 0
+
+        result, remaining = cache.fetch(short_tokens)
+        assert result is None
+        assert remaining == short_tokens
+        assert cache.get_stats()["misses"] == 1
+
     def test_fetch_prefix_match(self, small_cache, mock_kv_cache):
         # Store shorter sequence
         short_tokens = [1, 2, 3]
@@ -295,7 +356,11 @@ class TestMemoryAwarePrefixCache:
 
     def test_lru_eviction_on_memory_pressure(self, model, mock_kv_cache):
         # Create cache with 500KB limit
-        config = MemoryCacheConfig(max_memory_mb=0.5, max_entries=100)
+        config = MemoryCacheConfig(
+            max_memory_mb=0.5,
+            max_entries=100,
+            min_prefix_tokens=1,
+        )
         cache = MemoryAwarePrefixCache(model, config)
 
         # Store entries that together exceed limit
@@ -384,6 +449,54 @@ class TestMemoryAwarePrefixCache:
         assert stats["hits"] == 1
         assert stats["misses"] == 1
         assert stats["entry_count"] == 1
+
+    def test_try_reserve_and_release_memory(self, small_cache):
+        assert small_cache.try_reserve_memory(512 * 1024) is True
+        assert small_cache.get_stats()["current_memory_mb"] == 0.5
+
+        small_cache.release_reserved_memory(128 * 1024)
+        assert small_cache.get_stats()["current_memory_mb"] == 0.38
+
+    def test_try_reserve_memory_denies_over_limit(self, small_cache):
+        assert small_cache.try_reserve_memory(2 * 1024 * 1024) is False
+        assert small_cache.get_stats()["current_memory_mb"] == 0
+
+    def test_memory_mutations_wait_for_memory_lock(self, small_cache, mock_kv_cache):
+        def assert_waits_for_lock(operation):
+            result = {}
+            errors = []
+            small_cache._memory_lock.acquire()
+
+            def run_operation():
+                try:
+                    result["value"] = operation()
+                except Exception as exc:  # pragma: no cover - surfaced below
+                    errors.append(exc)
+
+            thread = threading.Thread(target=run_operation)
+            thread.start()
+            try:
+                time.sleep(0.05)
+                assert thread.is_alive()
+            finally:
+                small_cache._memory_lock.release()
+            thread.join(timeout=1)
+
+            assert not thread.is_alive()
+            assert errors == []
+            return result.get("value")
+
+        assert assert_waits_for_lock(
+            lambda: small_cache.store([10], mock_kv_cache(1000))
+        )
+
+        small_cache.store([20], mock_kv_cache(1000))
+        assert assert_waits_for_lock(lambda: small_cache.remove([20]))
+
+        small_cache.store([30], mock_kv_cache(1000))
+        assert_waits_for_lock(small_cache.clear)
+        assert len(small_cache) == 0
+        assert small_cache.memory_usage_mb == 0
 
     def test_reset_stats(self, small_cache, mock_kv_cache):
         small_cache.store([1, 2, 3], mock_kv_cache(1000))

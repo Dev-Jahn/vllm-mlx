@@ -9,6 +9,8 @@ from vllm_mlx.tool_parsers import (
     AutoToolParser,
     DeepSeekToolParser,
     FunctionaryToolParser,
+    Gemma4ToolParser,
+    Glm47ToolParser,
     GraniteToolParser,
     HermesToolParser,
     KimiToolParser,
@@ -39,6 +41,7 @@ class TestToolParserManager:
             "nemotron",
             "xlam",
             "functionary",
+            "gemma4",
         ]
         for p in expected:
             assert p in parsers, f"Parser '{p}' not found"
@@ -68,6 +71,7 @@ class TestToolParserManager:
             ("meetkai", FunctionaryToolParser),
             ("hermes", HermesToolParser),
             ("nous", HermesToolParser),
+            ("gemma4", Gemma4ToolParser),
         ]
         for name, expected_cls in test_cases:
             parser_cls = ToolParserManager.get_tool_parser(name)
@@ -135,6 +139,58 @@ class TestMistralToolParser:
         assert len(result.tool_calls) == 1
         assert result.tool_calls[0]["name"] == "get_weather"
 
+    def test_args_token_format(self, parser):
+        """Test parsing the newest Mistral format with an explicit [ARGS]
+        marker between the function name and its arguments, used by Ministral
+        3 and Devstral Small 2 (Dec 2025) tokenizers — confirmed directly in
+        their chat_template.jinja: '[TOOL_CALLS]' + name + '[ARGS]' + args.
+
+        Regression test: without recognizing the marker, the name previously
+        came back as "get_weather[ARGS]" instead of "get_weather".
+        """
+        text = '[TOOL_CALLS]get_weather[ARGS]{"city": "Paris"}'
+        result = parser.extract_tool_calls(text)
+
+        assert result.tools_called
+        assert len(result.tool_calls) == 1
+        assert result.tool_calls[0]["name"] == "get_weather"
+        args = json.loads(result.tool_calls[0]["arguments"])
+        assert args["city"] == "Paris"
+
+    def test_args_token_inside_json_arguments_uses_brace_boundary(self, parser):
+        """The [ARGS] marker is only the name/arguments boundary when it
+        comes before the first `{`. A legacy-format call whose JSON arguments
+        contain the literal "[ARGS]" substring must keep the `{` boundary."""
+        text = '[TOOL_CALLS]get_weather{"k": "[ARGS]"}'
+        result = parser.extract_tool_calls(text)
+
+        assert result.tools_called
+        assert len(result.tool_calls) == 1
+        assert result.tool_calls[0]["name"] == "get_weather"
+        args = json.loads(result.tool_calls[0]["arguments"])
+        assert args["k"] == "[ARGS]"
+
+    def test_marker_inside_json_string_does_not_forge_call(self, parser):
+        """A [TOOL_CALLS] marker inside a quoted JSON string value is
+        argument data, not a new call — it must never split into a second
+        dispatchable tool call."""
+        text = '[TOOL_CALLS]get_weather[ARGS]{"city": "[TOOL_CALLS]rm"}'
+        result = parser.extract_tool_calls(text)
+
+        assert result.tools_called
+        assert len(result.tool_calls) == 1
+        assert result.tool_calls[0]["name"] == "get_weather"
+        args = json.loads(result.tool_calls[0]["arguments"])
+        assert args["city"] == "[TOOL_CALLS]rm"
+
+    def test_args_token_rejects_non_json_arguments(self, parser):
+        """The [ARGS] format must not emit calls whose arguments do not
+        parse as JSON — rejecting beats dispatching corrupted arguments."""
+        text = "[TOOL_CALLS]get_weather[ARGS]not-json"
+        result = parser.extract_tool_calls(text)
+
+        assert not result.tools_called
+
     def test_no_tool_call(self, parser):
         """Test that regular text is not parsed as tool call."""
         text = "Hello, how can I help you today?"
@@ -150,6 +206,30 @@ class TestMistralToolParser:
 
         assert result.tools_called
         assert result.content == "Let me check the weather for you."
+
+    def test_odd_quotes_in_prose_before_marker(self, parser):
+        """Prose before the first [TOOL_CALLS] marker is not JSON. An odd
+        number of double quotes in that prose must not leave the marker
+        treated as inside a string (which would hide the call entirely)."""
+        text = (
+            'The column is called "id.[TOOL_CALLS]get_schema[ARGS]' '{"table":"users"}'
+        )
+        result = parser.extract_tool_calls(text)
+
+        assert result.tools_called
+        assert len(result.tool_calls) == 1
+        assert result.tool_calls[0]["name"] == "get_schema"
+        args = json.loads(result.tool_calls[0]["arguments"])
+        assert args == {"table": "users"}
+
+    def test_odd_quotes_in_prose_legacy_format(self, parser):
+        """Same odd-quote prose guard for the legacy `{` boundary format."""
+        text = 'The column is called "id.[TOOL_CALLS]get_schema' '{"table":"users"}'
+        result = parser.extract_tool_calls(text)
+
+        assert result.tools_called
+        assert len(result.tool_calls) == 1
+        assert result.tool_calls[0]["name"] == "get_schema"
 
 
 class TestQwenToolParser:
@@ -226,6 +306,333 @@ class TestLlamaToolParser:
 
         assert result.tools_called
         assert result.content == "Computing result"
+
+    # ------------------------------------------------------------------
+    # Tests for the python-tag and bare-JSON formats. The legacy
+    # `<function=name>{...}</function>` format above still works; these
+    # cover the additional shapes Llama 3.1+ / 3.3 / 4 actually emit at
+    # inference time.
+    # ------------------------------------------------------------------
+
+    def test_python_tag_json_format(self, parser):
+        """Llama 3.1+ / 4 canonical: <|python_tag|>{name, parameters}."""
+        text = '<|python_tag|>{"name": "read_file", "parameters": {"path": "foo.py"}}'
+        result = parser.extract_tool_calls(text)
+
+        assert result.tools_called
+        assert len(result.tool_calls) == 1
+        assert result.tool_calls[0]["name"] == "read_file"
+        args = json.loads(result.tool_calls[0]["arguments"])
+        assert args == {"path": "foo.py"}
+
+    def test_python_tag_arguments_alias(self, parser):
+        """Same wire shape with `arguments` instead of `parameters`."""
+        text = '<|python_tag|>{"name": "run_command", "arguments": {"cmd": "ls"}}'
+        result = parser.extract_tool_calls(text)
+
+        assert result.tools_called
+        assert result.tool_calls[0]["name"] == "run_command"
+        assert json.loads(result.tool_calls[0]["arguments"]) == {"cmd": "ls"}
+
+    def test_python_tag_multiple_calls(self, parser):
+        """Two python_tag calls in one response."""
+        text = (
+            '<|python_tag|>{"name": "read_file", "parameters": {"path": "a.py"}}'
+            '<|python_tag|>{"name": "read_file", "parameters": {"path": "b.py"}}'
+        )
+        result = parser.extract_tool_calls(text)
+
+        assert result.tools_called
+        assert len(result.tool_calls) == 2
+
+    def test_python_tag_semicolon_separated_calls(self, parser):
+        """vLLM's Llama format separates multiple JSON calls with semicolons."""
+        text = (
+            '<|python_tag|>{"name": "read_file", "parameters": {"path": "a.py"}}; '
+            '{"name": "read_file", "parameters": {"path": "b.py"}}'
+        )
+
+        result = parser.extract_tool_calls(text)
+
+        assert result.tools_called
+        assert [call["name"] for call in result.tool_calls] == [
+            "read_file",
+            "read_file",
+        ]
+        assert result.content is None
+
+    def test_bare_json_semicolon_separated_calls(self, parser):
+        """Bare Llama JSON can contain semicolon-separated calls."""
+        text = (
+            '{"name": "first", "parameters": {}}; '
+            '{"name": "second", "parameters": {}}'
+        )
+
+        result = parser.extract_tool_calls(text)
+
+        assert result.tools_called
+        assert [call["name"] for call in result.tool_calls] == ["first", "second"]
+        assert result.content is None
+
+    def test_mixed_formats_preserve_source_order(self, parser):
+        """Legacy and tagged calls must stay in their original order."""
+        text = (
+            '<function=legacy>{"value": 1}</function>'
+            '<|python_tag|>{"name": "modern", "parameters": {}}'
+        )
+
+        result = parser.extract_tool_calls(text)
+
+        assert [call["name"] for call in result.tool_calls] == ["legacy", "modern"]
+
+    @pytest.mark.parametrize("parameters", [None, True, "hello"])
+    def test_python_tag_arguments_are_always_json(self, parser, parameters):
+        """The OpenAI arguments field must contain valid JSON for any value."""
+        text = "<|python_tag|>" + json.dumps(
+            {"name": "inspect", "parameters": parameters}
+        )
+
+        result = parser.extract_tool_calls(text)
+
+        assert json.loads(result.tool_calls[0]["arguments"]) == parameters
+
+    def test_bare_json_format(self, parser):
+        """Llama 3.3: bare {type, name, parameters} JSON envelope, no marker."""
+        text = '{"type": "function", "name": "read_file", "parameters": {"path": "foo.py"}}'
+        result = parser.extract_tool_calls(text)
+
+        assert result.tools_called
+        assert len(result.tool_calls) == 1
+        assert result.tool_calls[0]["name"] == "read_file"
+        assert json.loads(result.tool_calls[0]["arguments"]) == {"path": "foo.py"}
+
+    def test_bare_json_without_type(self, parser):
+        """Bare JSON envelope without the `type` field still parses."""
+        text = '{"name": "grep", "parameters": {"pattern": "TODO"}}'
+        result = parser.extract_tool_calls(text)
+
+        assert result.tools_called
+        assert result.tool_calls[0]["name"] == "grep"
+
+    def test_plain_text_is_not_a_tool_call(self, parser):
+        """Plain text without any marker or JSON envelope must NOT be flagged."""
+        text = "I cannot find the file you mentioned."
+        result = parser.extract_tool_calls(text)
+
+        assert not result.tools_called
+        assert result.tool_calls == []
+        assert result.content == text
+
+    def test_non_tool_json_is_not_a_tool_call(self, parser):
+        """Bare JSON that lacks the `name`+`parameters` shape must NOT be flagged."""
+        text = '{"value": 42, "summary": "computed"}'
+        result = parser.extract_tool_calls(text)
+
+        assert not result.tools_called
+
+    def test_python_tag_takes_precedence_over_bare_json(self, parser):
+        """When a python_tag call is present, the bare-JSON path is skipped to
+        avoid double-counting."""
+        text = '<|python_tag|>{"name": "read_file", "parameters": {"path": "foo.py"}}'
+        result = parser.extract_tool_calls(text)
+
+        assert len(result.tool_calls) == 1
+
+    # ------------------------------------------------------------------
+    # Streaming tests. Each test drives ``extract_tool_calls_streaming``
+    # incrementally with the chunks the runtime would deliver and checks
+    # that the parser buffers until the call(s) parse, then emits exactly
+    # once. Plain assistant content must still stream per chunk.
+    # ------------------------------------------------------------------
+
+    def _stream(self, parser, chunks):
+        """Drive the streaming parser with successive deltas; return the list
+        of non-``None`` events it emits."""
+        events = []
+        prev = ""
+        for delta in chunks:
+            curr = prev + delta
+            ev = parser.extract_tool_calls_streaming(prev, curr, delta)
+            if ev is not None:
+                events.append(ev)
+            prev = curr
+        return events
+
+    def test_streaming_xml_format_still_works(self, parser):
+        """Existing legacy XML behaviour must not regress."""
+        chunks = [
+            '<function=read_file>{"path": "',
+            "foo.py",
+            '"}</function>',
+        ]
+        events = self._stream(parser, chunks)
+        # Only the final chunk (containing </function>) emits a tool_calls event;
+        # the preceding chunks return None while we buffer.
+        tool_events = [e for e in events if "tool_calls" in e]
+        content_events = [e for e in events if "content" in e]
+        assert len(tool_events) == 1
+        assert tool_events[0]["tool_calls"][0]["function"]["name"] == "read_file"
+        assert content_events == []
+
+    def test_streaming_python_tag_emits_tool_call(self, parser):
+        """Llama 3.1+/4 python_tag format streams through cleanly without
+        leaking the JSON payload as assistant content."""
+        chunks = [
+            "<|python_tag|>",
+            '{"name": "run_command", ',
+            '"parameters": {"cmd": "',
+            'ls"}}',
+        ]
+        events = self._stream(parser, chunks)
+        tool_events = [e for e in events if "tool_calls" in e]
+        content_events = [e for e in events if "content" in e]
+        assert len(tool_events) == 1
+        assert tool_events[0]["tool_calls"][0]["function"]["name"] == "run_command"
+        # Critical: none of the JSON payload should have been streamed
+        # back to the client as assistant content.
+        assert content_events == []
+
+    def test_streaming_bare_json_emits_tool_call(self, parser):
+        """Llama 3.3 bare-JSON envelope must also be detected without a
+        leading marker — the discriminator is the ``"name"`` field."""
+        chunks = [
+            '{"type": "function", ',
+            '"name": "read_file", ',
+            '"parameters": {"path": "foo.py"}}',
+        ]
+        events = self._stream(parser, chunks)
+        tool_events = [e for e in events if "tool_calls" in e]
+        content_events = [e for e in events if "content" in e]
+        assert len(tool_events) == 1
+        assert tool_events[0]["tool_calls"][0]["function"]["name"] == "read_file"
+        assert content_events == []
+
+    def test_streaming_multiple_python_tag_calls_emit_each_once(self, parser):
+        """Sequential python-tag calls must not replay completed calls."""
+        chunks = [
+            '<|python_tag|>{"name": "first", "parameters": {}}',
+            "<|python_tag|>",
+            '{"name": "second", "parameters": {}}',
+        ]
+
+        events = self._stream(parser, chunks)
+        calls = [call for event in events for call in event.get("tool_calls", [])]
+
+        assert [call["index"] for call in calls] == [0, 1]
+        assert [call["function"]["name"] for call in calls] == ["first", "second"]
+
+    def test_streaming_semicolon_calls_emit_each_once(self, parser):
+        """Single-tag semicolon calls must stream without leaking separators."""
+        chunks = [
+            '<|python_tag|>{"name": "first", "parameters": {}}',
+            "; ",
+            '{"name": "second", "parameters": {}}',
+        ]
+
+        events = self._stream(parser, chunks)
+        calls = [call for event in events for call in event.get("tool_calls", [])]
+        content = "".join(event.get("content", "") for event in events)
+
+        assert [call["index"] for call in calls] == [0, 1]
+        assert [call["function"]["name"] for call in calls] == ["first", "second"]
+        assert content == ""
+
+    def test_streaming_bare_semicolon_calls_emit_each_once(self, parser):
+        """Bare semicolon calls must stream once and without separators."""
+        chunks = [
+            '{"name": "first", "parameters": {}}',
+            "; ",
+            '{"name": "second", "parameters": {}}',
+        ]
+
+        events = self._stream(parser, chunks)
+        calls = [call for event in events for call in event.get("tool_calls", [])]
+
+        assert [call["index"] for call in calls] == [0, 1]
+        assert [call["function"]["name"] for call in calls] == ["first", "second"]
+        assert "".join(event.get("content", "") for event in events) == ""
+
+    def test_streaming_mixed_formats_emit_in_source_order(self, parser):
+        """Adding a tagged call after XML must not replay the XML call."""
+        chunks = [
+            '<function=legacy>{"value": 1}</function>',
+            '<|python_tag|>{"name": "modern", "parameters": {}}',
+        ]
+
+        events = self._stream(parser, chunks)
+        calls = [call for event in events for call in event.get("tool_calls", [])]
+
+        assert [call["index"] for call in calls] == [0, 1]
+        assert [call["function"]["name"] for call in calls] == ["legacy", "modern"]
+
+    def test_streaming_non_tool_json_flushes_buffered_content(self, parser):
+        """A leading brace that becomes ordinary JSON must not lose content."""
+        chunks = ["{", '"value": 42}']
+
+        events = self._stream(parser, chunks)
+
+        assert events == [{"content": '{"value": 42}'}]
+
+    def test_streaming_non_tool_json_never_duplicates_content(self, parser):
+        """Once ordinary JSON is flushed, later chunks emit only new bytes."""
+        chunks = ["{", '"value":', " 42", "}"]
+
+        events = self._stream(parser, chunks)
+
+        assert "".join(event.get("content", "") for event in events) == (
+            '{"value": 42}'
+        )
+
+    def test_streaming_type_first_non_tool_json_flushes_content(self, parser):
+        """A complete type-first object without a tool payload remains content."""
+        chunks = ['{"type": ', '"summary", ', '"value": 42}']
+
+        events = self._stream(parser, chunks)
+
+        assert events == [{"content": '{"type": "summary", "value": 42}'}]
+
+    @pytest.mark.parametrize(
+        "chunks",
+        [
+            ['{"name": "Alice"}', " is a person."],
+            ['{"type": "summary"} trailing prose'],
+        ],
+    )
+    def test_streaming_non_tool_json_keeps_trailing_content(self, parser, chunks):
+        """A completed non-tool object must switch to content passthrough."""
+        events = self._stream(parser, chunks)
+
+        assert "".join(event.get("content", "") for event in events) == "".join(chunks)
+
+    def test_streaming_keeps_content_around_completed_call(self, parser):
+        """Content sharing a delta with a call must remain visible."""
+        chunks = ['Before <|python_tag|>{"name": "read", "parameters": {}} After']
+
+        events = self._stream(parser, chunks)
+
+        assert len(events) == 1
+        assert events[0]["content"] == "Before  After"
+        assert events[0]["tool_calls"][0]["function"]["name"] == "read"
+
+    def test_streaming_finalizer_restores_incomplete_bare_json(self, parser):
+        """Ambiguous JSON at EOF must fall back to assistant content."""
+        text = '{"name": "Alice"'
+
+        assert parser.finalize_streaming(text) == {"content": text}
+
+    def test_streaming_finalizer_hides_incomplete_tagged_call(self, parser):
+        """Incomplete protocol markup must not leak when the stream ends."""
+        text = '<|python_tag|>{"name": "read"'
+
+        assert parser.finalize_streaming(text) == {"content": ""}
+
+    def test_streaming_plain_text_streams_as_content(self, parser):
+        """Plain assistant text without a tool marker must stream per chunk
+        as ``{"content": delta_text}``."""
+        chunks = ["I will ", "look at ", "foo.py for you."]
+        events = self._stream(parser, chunks)
+        assert all("content" in e for e in events)
+        assert [e["content"] for e in events] == chunks
 
 
 class TestHermesToolParser:
@@ -552,6 +959,16 @@ class TestAutoToolParser:
         assert result.tools_called
         assert result.tool_calls[0]["name"] == "add"
 
+    def test_detects_bare_bracket(self, parser):
+        """Test auto detection of bare bracket format."""
+        text = '[read({"file_path": "/tmp/test.py"})]'
+        result = parser.extract_tool_calls(text)
+
+        assert result.tools_called
+        assert result.tool_calls[0]["name"] == "read"
+        args = json.loads(result.tool_calls[0]["arguments"])
+        assert args["file_path"] == "/tmp/test.py"
+
     def test_detects_llama(self, parser):
         """Test auto detection of Llama format."""
         text = '<function=multiply>{"x": 2}</function>'
@@ -582,6 +999,23 @@ class TestAutoToolParser:
         result = parser.extract_tool_calls(text)
 
         assert not result.tools_called
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "Read [the docs](https://example.test) before changing this.",
+            "The output array was [1, 2, 3], not a tool call.",
+            'Here is JSON: [{"label": "alpha", "score": 0.7}]',
+            "Use [square brackets] for optional text.",
+            "This prose mentions [read(file_path)] without JSON arguments.",
+        ],
+    )
+    def test_no_false_positive_for_ordinary_bracket_text(self, parser, text):
+        """Ordinary bracket text should remain content, not auto tool calls."""
+        result = parser.extract_tool_calls(text)
+
+        assert not result.tools_called
+        assert result.content == text
 
 
 class TestEdgeCases:
@@ -648,6 +1082,60 @@ class TestEdgeCases:
         assert len(ids) == len(set(ids)), "Tool call IDs should be unique"
 
 
+class TestBareBracketStreaming:
+    """Test streaming for bare bracket tool calls."""
+
+    def test_auto_streaming_bare_bracket(self):
+        """Auto parser should emit structured tool calls for bare bracket streaming."""
+        parser = AutoToolParser()
+
+        chunks = [
+            "[read(",
+            '{"file_path": "/tmp/test.py"}',
+            ")]",
+        ]
+        accumulated = ""
+        tool_calls_found = False
+
+        for chunk in chunks:
+            prev = accumulated
+            accumulated += chunk
+            r = parser.extract_tool_calls_streaming(
+                previous_text=prev,
+                current_text=accumulated,
+                delta_text=chunk,
+            )
+            if r is not None and "tool_calls" in r:
+                tool_calls_found = True
+                assert r["tool_calls"][0]["function"]["name"] == "read"
+                args = json.loads(r["tool_calls"][0]["function"]["arguments"])
+                assert args["file_path"] == "/tmp/test.py"
+                break
+
+        assert tool_calls_found
+
+    @pytest.mark.parametrize(
+        "delta",
+        [
+            "See [the docs](https://example.test)",
+            "Values: [1, 2, 3]",
+            'JSON data: [{"label": "alpha"}]',
+            "Literal [square brackets] in text",
+        ],
+    )
+    def test_auto_streaming_ordinary_brackets_emit_content(self, delta):
+        """Auto streaming should not suppress ordinary bracket text."""
+        parser = AutoToolParser()
+
+        result = parser.extract_tool_calls_streaming(
+            previous_text="",
+            current_text=delta,
+            delta_text=delta,
+        )
+
+        assert result == {"content": delta}
+
+
 class TestStreamingParsing:
     """Test streaming tool call parsing."""
 
@@ -669,6 +1157,344 @@ class TestStreamingParsing:
             delta_text="[TOOL_CALLS]",
         )
         # Should start tool call parsing
+
+    def test_mistral_streaming_args_token(self):
+        """Regression test: streaming reconstruction of the [ARGS]-marker
+        format must never misclassify mid-argument JSON fragments as more
+        of the function name.
+
+        This replays the literal delta sequence captured from a live
+        vllm-mlx server response for mlx-community/Ministral-3-14B-Instruct-2512-4bit
+        (--tool-call-parser mistral), which previously reconstructed as
+        name="get_weather[ARGS]city\":\"Paris\"}" / arguments='[ARGS]{"'
+        instead of the correct name="get_weather" / arguments='{"city": "Paris"}'.
+        """
+        parser = MistralToolParser()
+        deltas = [
+            "[TOOL_CALLS]get",
+            "_",
+            "weather",
+            "[ARGS]",
+            '{"',
+            "city",
+            '":',
+            '"',
+            "Paris",
+            '"}',
+        ]
+
+        name_parts: list[str] = []
+        args_parts: list[str] = []
+        current = ""
+        for delta in deltas:
+            previous = current
+            current += delta
+            result = parser.extract_tool_calls_streaming(
+                previous_text=previous,
+                current_text=current,
+                delta_text=delta,
+            )
+            if not result:
+                continue
+            for tc in result.get("tool_calls", []):
+                func = tc.get("function", {})
+                if "name" in func:
+                    name_parts.append(func["name"])
+                if "arguments" in func:
+                    args_parts.append(func["arguments"])
+
+        assert "".join(name_parts) == "get_weather"
+        assert "".join(args_parts) == '{"city":"Paris"}'
+
+    def test_mistral_streaming_args_token_split_across_deltas(self):
+        """The [ARGS] marker itself may be split across two deltas
+        (e.g. tokenizer boundaries don't align with the marker). The parser
+        must still find it once both halves have arrived, rather than ever
+        misclassifying the fragments."""
+        parser = MistralToolParser()
+        deltas = ["[TOOL_CALLS]get_weather[AR", 'GS]{"city": "Paris"}']
+
+        name_parts: list[str] = []
+        args_parts: list[str] = []
+        current = ""
+        for delta in deltas:
+            previous = current
+            current += delta
+            result = parser.extract_tool_calls_streaming(
+                previous_text=previous,
+                current_text=current,
+                delta_text=delta,
+            )
+            if not result:
+                continue
+            for tc in result.get("tool_calls", []):
+                func = tc.get("function", {})
+                if "name" in func:
+                    name_parts.append(func["name"])
+                if "arguments" in func:
+                    args_parts.append(func["arguments"])
+
+        assert "".join(name_parts) == "get_weather"
+        assert "".join(args_parts) == '{"city": "Paris"}'
+
+    def test_mistral_streaming_args_token_has_stable_id(self):
+        """Regression test: the [ARGS] marker defers the name/arguments
+        boundary past the delta containing BOT_TOKEN, so the tool-call id
+        must not be tied to that specific delta — it needs to land on
+        whichever delta is actually first to carry name/arguments, and only
+        once, so accumulation on the client produces a single stable id
+        rather than dropping it entirely."""
+        parser = MistralToolParser()
+        deltas = [
+            "[TOOL_CALLS]",
+            "get",
+            "_",
+            "weather",
+            "[ARGS]",
+            '{"',
+            "city",
+            '":',
+            '"',
+            "Paris",
+            '"}',
+        ]
+
+        ids_seen: list[str] = []
+        id_function: list[dict] = []
+        current = ""
+        for delta in deltas:
+            previous = current
+            current += delta
+            result = parser.extract_tool_calls_streaming(
+                previous_text=previous,
+                current_text=current,
+                delta_text=delta,
+            )
+            if not result:
+                continue
+            for tc in result.get("tool_calls", []):
+                if "id" in tc:
+                    ids_seen.append(tc["id"])
+                    id_function.append(tc.get("function", {}))
+
+        assert len(ids_seen) == 1
+        assert ids_seen[0]
+        # The id must ride the first delta that carries real content (the
+        # complete buffered name), never the empty BOT_TOKEN delta.
+        assert id_function[0].get("name") == "get_weather"
+
+    def test_mistral_streaming_legacy_brace_reconstruction(self):
+        """The rewritten streaming parser also owns the legacy `{` boundary.
+        Replaying the old format delta by delta must reconstruct the name and
+        arguments correctly — removing "{" from the marker scan must fail
+        this test."""
+        parser = MistralToolParser()
+        deltas = [
+            "[TOOL_CALLS]get",
+            "_",
+            "weather",
+            '{"',
+            "city",
+            '": "',
+            "London",
+            '"}',
+        ]
+
+        name_parts: list[str] = []
+        args_parts: list[str] = []
+        current = ""
+        for delta in deltas:
+            previous = current
+            current += delta
+            result = parser.extract_tool_calls_streaming(
+                previous_text=previous,
+                current_text=current,
+                delta_text=delta,
+            )
+            if not result:
+                continue
+            for tc in result.get("tool_calls", []):
+                func = tc.get("function", {})
+                if "name" in func:
+                    name_parts.append(func["name"])
+                if "arguments" in func:
+                    args_parts.append(func["arguments"])
+
+        assert "".join(name_parts) == "get_weather"
+        assert "".join(args_parts) == '{"city": "London"}'
+
+    def test_mistral_streaming_marker_in_arguments_does_not_reset(self):
+        """Once the name/arguments boundary was passed, a [TOOL_CALLS] marker
+        inside the arguments text is data, not a new call — it must never
+        reset the streaming state or forge a second call."""
+        parser = MistralToolParser()
+        deltas = [
+            "[TOOL_CALLS]get",
+            "_weather",
+            "[ARGS]",
+            '{"city": "',
+            "[TOOL_CALLS]rm",
+            '"}',
+        ]
+
+        name_parts: list[str] = []
+        args_parts: list[str] = []
+        current = ""
+        for delta in deltas:
+            previous = current
+            current += delta
+            result = parser.extract_tool_calls_streaming(
+                previous_text=previous,
+                current_text=current,
+                delta_text=delta,
+            )
+            if not result:
+                continue
+            for tc in result.get("tool_calls", []):
+                func = tc.get("function", {})
+                if "name" in func:
+                    name_parts.append(func["name"])
+                if "arguments" in func:
+                    args_parts.append(func["arguments"])
+
+        assert "".join(name_parts) == "get_weather"
+        assert "".join(args_parts) == '{"city": "[TOOL_CALLS]rm"}'
+
+    def test_mistral_streaming_marker_never_arrives_emits_content(self):
+        """If the boundary marker never arrives (truncation or the model
+        deviating into prose after [TOOL_CALLS]), the withheld text must be
+        flushed as content instead of silently lost, and the name buffer
+        must stay bounded."""
+        parser = MistralToolParser()
+        deltas = ["[TOOL_CALLS]get", "_weather", " then", " prose"] + ["word"] * 80
+
+        content_parts: list[str] = []
+        current = ""
+        for delta in deltas:
+            previous = current
+            current += delta
+            result = parser.extract_tool_calls_streaming(
+                previous_text=previous,
+                current_text=current,
+                delta_text=delta,
+            )
+            if result and "content" in result:
+                content_parts.append(result["content"])
+
+        assert content_parts
+        assert "".join(content_parts).startswith("get_weather then prose")
+        assert parser._name_buffer == ""
+        assert parser._name_buffer_overflow
+
+    def test_mistral_streaming_parallel_args_calls(self):
+        """Two consecutive [ARGS] tool calls in one streamed response must
+        open separate indices instead of collapsing into a single call with
+        malformed concatenated arguments. Regression: the `_args_started`
+        early return used to swallow the second [TOOL_CALLS] delta."""
+        parser = MistralToolParser()
+        deltas = [
+            "[TOOL_CALLS]",
+            "get_weather",
+            "[ARGS]",
+            '{"city":"Madrid"}',
+            "[TOOL_CALLS]",
+            "get_time",
+            "[ARGS]",
+            '{"tz":"CET"}',
+        ]
+
+        indices: list[int] = []
+        args: dict[int, str] = {}
+        current = ""
+        for delta in deltas:
+            previous = current
+            current += delta
+            result = parser.extract_tool_calls_streaming(
+                previous_text=previous,
+                current_text=current,
+                delta_text=delta,
+            )
+            if not result:
+                continue
+            for tc in result.get("tool_calls", []):
+                idx = tc["index"]
+                indices.append(idx)
+                args[idx] = args.get(idx, "") + tc.get("function", {}).get(
+                    "arguments", ""
+                )
+
+        assert sorted(set(indices)) == [0, 1]
+        assert json.loads(args[0]) == {"city": "Madrid"}
+        assert json.loads(args[1]) == {"tz": "CET"}
+
+    def test_mistral_streaming_parallel_legacy_calls(self):
+        """Same regression check for the legacy `{` boundary format, which
+        main already streamed as separate indices."""
+        parser = MistralToolParser()
+        deltas = [
+            "[TOOL_CALLS]get_weather",
+            '{"city":"Madrid"}',
+            "[TOOL_CALLS]get_time",
+            '{"tz":"CET"}',
+        ]
+
+        indices: list[int] = []
+        args: dict[int, str] = {}
+        current = ""
+        for delta in deltas:
+            previous = current
+            current += delta
+            result = parser.extract_tool_calls_streaming(
+                previous_text=previous,
+                current_text=current,
+                delta_text=delta,
+            )
+            if not result:
+                continue
+            for tc in result.get("tool_calls", []):
+                idx = tc["index"]
+                indices.append(idx)
+                args[idx] = args.get(idx, "") + tc.get("function", {}).get(
+                    "arguments", ""
+                )
+
+        assert sorted(set(indices)) == [0, 1]
+        assert json.loads(args[0]) == {"city": "Madrid"}
+        assert json.loads(args[1]) == {"tz": "CET"}
+
+    def test_mistral_streaming_second_call_in_same_delta(self):
+        """A new call may begin inside an argument delta (the marker is not
+        its own token). The pre-marker text closes the current call and the
+        remainder opens the next index."""
+        parser = MistralToolParser()
+        deltas = [
+            "[TOOL_CALLS]get_weather[ARGS]",
+            '{"city":"Madrid"}[TOOL_CALLS]get_time[ARGS]{"tz":"CET"}',
+        ]
+
+        indices: list[int] = []
+        args: dict[int, str] = {}
+        current = ""
+        for delta in deltas:
+            previous = current
+            current += delta
+            result = parser.extract_tool_calls_streaming(
+                previous_text=previous,
+                current_text=current,
+                delta_text=delta,
+            )
+            if not result:
+                continue
+            for tc in result.get("tool_calls", []):
+                idx = tc["index"]
+                indices.append(idx)
+                args[idx] = args.get(idx, "") + tc.get("function", {}).get(
+                    "arguments", ""
+                )
+
+        assert sorted(set(indices)) == [0, 1]
+        assert json.loads(args[0]) == {"city": "Madrid"}
+        assert json.loads(args[1]) == {"tz": "CET"}
 
     def test_auto_streaming(self):
         """Test auto parser streaming."""
@@ -746,9 +1572,11 @@ class TestQwen3CoderParser:
     """Test Qwen3-Coder tool call parsing (Issue #47)."""
 
     def test_qwen3_coder_alias_registered(self):
-        """Test that qwen3_coder is registered as an alias for HermesToolParser."""
+        """Test that qwen3_coder is registered as an alias for Qwen3XMLToolParser."""
+        from vllm_mlx.tool_parsers.qwen3_xml_tool_parser import Qwen3XMLToolParser
+
         parser_cls = ToolParserManager.get_tool_parser("qwen3_coder")
-        assert parser_cls == HermesToolParser
+        assert parser_cls == Qwen3XMLToolParser
 
     def test_qwen3_coder_xml_format(self):
         """Test parsing Qwen3-Coder XML format (Nemotron-style)."""
@@ -811,9 +1639,7 @@ class TestQwen3CoderParser:
     def test_bare_function_without_tool_call_wrapper(self):
         """Test bare <function=...> blocks without <tool_call> wrapper."""
         parser = HermesToolParser()
-        text = (
-            "<function=get_weather>" "<parameter=city>Berlin</parameter>" "</function>"
-        )
+        text = "<function=get_weather><parameter=city>Berlin</parameter></function>"
         result = parser.extract_tool_calls(text)
 
         assert result.tools_called
@@ -1160,3 +1986,410 @@ class TestHermesStreamingFixes:
         assert len(emitted_calls) == 2
         assert emitted_calls[0]["function"]["name"] == "func1"
         assert emitted_calls[1]["function"]["name"] == "func2"
+
+
+class TestQwenFunctionFormat:
+    """Test Qwen parser's <function=name> format support."""
+
+    @pytest.fixture
+    def parser(self):
+        return QwenToolParser()
+
+    def test_function_format_with_parameters(self, parser):
+        """Test <function=name><parameter=key>value</parameter></function>."""
+        text = "<function=get_weather><parameter=city>Prague</parameter></function>"
+        result = parser.extract_tool_calls(text)
+        assert result.tools_called
+        assert result.tool_calls[0]["name"] == "get_weather"
+        args = json.loads(result.tool_calls[0]["arguments"])
+        assert args["city"] == "Prague"
+
+    def test_function_format_with_json(self, parser):
+        """Test <function=name>{"key": "val"}</function>."""
+        text = '<function=get_weather>{"city": "Prague"}</function>'
+        result = parser.extract_tool_calls(text)
+        assert result.tools_called
+        assert result.tool_calls[0]["name"] == "get_weather"
+        args = json.loads(result.tool_calls[0]["arguments"])
+        assert args["city"] == "Prague"
+
+    def test_function_format_multiple(self, parser):
+        """Test multiple <function=...> blocks."""
+        text = (
+            '<function=read_file>{"path": "/a.py"}</function>'
+            '<function=write_file>{"path": "/b.py", "content": "hello"}</function>'
+        )
+        result = parser.extract_tool_calls(text)
+        assert result.tools_called
+        assert len(result.tool_calls) == 2
+        assert result.tool_calls[0]["name"] == "read_file"
+        assert result.tool_calls[1]["name"] == "write_file"
+
+    def test_function_format_with_think_tags(self, parser):
+        """Test <function=...> with think tags."""
+        text = (
+            "<think>I need to check the weather.</think>\n"
+            '<function=get_weather>{"city": "Prague"}</function>'
+        )
+        result = parser.extract_tool_calls(text)
+        assert result.tools_called
+        assert result.tool_calls[0]["name"] == "get_weather"
+
+
+class TestQwenMixedFormatAndTruncation:
+    """Regression tests for multi-format extraction and truncated output.
+
+    Bug 1: previously the function-style pass was guarded by ``if not tool_calls``,
+    so an XML tool call followed by a ``<function=...>`` tool call only yielded the
+    XML one — the function markup leaked into ``content``.
+
+    Bug 2: when generation hit ``max_tokens`` mid tool call (Qwen3.6 emits nested
+    ``<tool_call>\n<function=name>...</function>\n</tool_call>``), the truncated
+    second call's raw markup was returned in ``content``.
+    """
+
+    @pytest.fixture
+    def parser(self):
+        return QwenToolParser()
+
+    def test_xml_then_function_mixed(self, parser):
+        """XML call followed by function-style call — both should be extracted."""
+        text = (
+            '<tool_call>\n{"name": "get_weather", "arguments": {"city": "Prague"}}'
+            "\n</tool_call>\n"
+            "<function=convert_currency>\n"
+            "<parameter=amount>100</parameter>\n"
+            "<parameter=from_currency>EUR</parameter>\n"
+            "<parameter=to_currency>CZK</parameter>\n"
+            "</function>"
+        )
+        result = parser.extract_tool_calls(text)
+        assert result.tools_called
+        assert len(result.tool_calls) == 2
+        assert result.tool_calls[0]["name"] == "get_weather"
+        assert result.tool_calls[1]["name"] == "convert_currency"
+        args = json.loads(result.tool_calls[1]["arguments"])
+        assert args == {
+            "amount": 100,
+            "from_currency": "EUR",
+            "to_currency": "CZK",
+        }
+        # No raw markup left in content
+        assert result.content in (None, "")
+
+    def test_nested_function_in_tool_call_wrappers(self, parser):
+        """Qwen3.6 nests <function=...> inside <tool_call>...</tool_call>."""
+        text = (
+            "<tool_call>\n"
+            "<function=get_weather>\n"
+            "<parameter=city>Prague</parameter>\n"
+            "</function>\n"
+            "</tool_call>\n"
+            "<tool_call>\n"
+            "<function=convert_currency>\n"
+            "<parameter=amount>100</parameter>\n"
+            "<parameter=from_currency>EUR</parameter>\n"
+            "<parameter=to_currency>CZK</parameter>\n"
+            "</function>\n"
+            "</tool_call>"
+        )
+        result = parser.extract_tool_calls(text)
+        assert result.tools_called
+        assert len(result.tool_calls) == 2
+        assert result.tool_calls[0]["name"] == "get_weather"
+        assert result.tool_calls[1]["name"] == "convert_currency"
+        assert result.content in (None, "")
+
+    def test_truncated_second_tool_call_no_leak(self, parser):
+        """One complete + one truncated <tool_call> — only the first call,
+        no raw markup in content."""
+        text = (
+            "<tool_call>\n"
+            "<function=get_weather>\n"
+            "<parameter=city>Prague</parameter>\n"
+            "</function>\n"
+            "</tool_call>\n"
+            "<tool_call>\n"
+            "<function=convert_currency>\n"
+            "<parameter=amount>\n1"
+        )
+        result = parser.extract_tool_calls(text)
+        assert result.tools_called
+        assert len(result.tool_calls) == 1
+        assert result.tool_calls[0]["name"] == "get_weather"
+        # The truncated second call must NOT leak into content
+        content = result.content or ""
+        assert "<tool_call>" not in content
+        assert "<function=" not in content
+        assert "<parameter=" not in content
+
+    def test_truncated_only_no_complete_tool_call(self, parser):
+        """No complete tool call — pure plain-text prefix is preserved, but the
+        partial ``<tool_call>`` markup at end is stripped."""
+        text = "Let me check the weather. <tool_call>"
+        result = parser.extract_tool_calls(text)
+        assert not result.tools_called
+        assert len(result.tool_calls) == 0
+        content = result.content or ""
+        assert "<tool_call>" not in content
+        assert content.startswith("Let me check the weather.")
+
+    def test_truncated_function_only(self, parser):
+        """Plain text with truncated <function= and no closing tag."""
+        text = "I'll call: <function=get_weather>"
+        result = parser.extract_tool_calls(text)
+        assert not result.tools_called
+        content = result.content or ""
+        assert "<function=" not in content
+        assert content.startswith("I'll call:")
+
+    def test_truncated_bracket_call(self, parser):
+        """Partial ``[Calling tool: ...`` without closing ``)]`` is stripped."""
+        text = 'Let me check. [Calling tool: get_weather({"city":"Prague"'
+        result = parser.extract_tool_calls(text)
+        assert not result.tools_called
+        content = result.content or ""
+        assert "[Calling tool:" not in content
+        assert content.startswith("Let me check.")
+
+    def test_complete_function_then_truncated_function(self, parser):
+        """Two ``<function=...>`` blocks where the second is truncated."""
+        text = (
+            '<function=get_weather>{"city": "Prague"}</function>\n'
+            "<function=convert_currency><parameter=amount>10"
+        )
+        result = parser.extract_tool_calls(text)
+        assert result.tools_called
+        assert len(result.tool_calls) == 1
+        assert result.tool_calls[0]["name"] == "get_weather"
+        content = result.content or ""
+        assert "<function=" not in content
+        assert "<parameter=" not in content
+
+    def test_no_tool_calls_returns_string_not_none(self, parser):
+        """When the parser strips truncated markup to empty, it must return
+        an empty string (not ``None``) so downstream code can tell the parser
+        actually processed the input.
+
+        Without this, the server's fallback path would receive ``content=None``
+        and resurface the raw markup it just stripped (regression observed
+        against Qwen3.6-35B with ``max_tokens`` truncation in the chat handler).
+        """
+        # Fully stripped → empty string
+        result = parser.extract_tool_calls("<tool_call>\n<function=calculate")
+        assert not result.tools_called
+        assert result.content == ""
+        # Partially stripped → non-empty string
+        result = parser.extract_tool_calls("Some text. <tool_call>")
+        assert not result.tools_called
+        assert isinstance(result.content, str)
+        assert result.content == "Some text."
+        # Plain text untouched → original string
+        result = parser.extract_tool_calls("Hello world.")
+        assert not result.tools_called
+        assert result.content == "Hello world."
+
+
+class TestQwenStreamingBuffering:
+    """Test Qwen parser streaming with partial-marker buffering."""
+
+    @pytest.fixture
+    def parser(self):
+        return QwenToolParser()
+
+    def test_streaming_function_format_complete(self, parser):
+        """Test streaming with <function=name>...</function> format."""
+        chunks = [
+            "<function=get_weather>",
+            "<parameter=city>Prague</parameter>",
+            "</function>",
+        ]
+        accumulated = ""
+        tool_calls_found = False
+        for chunk in chunks:
+            prev = accumulated
+            accumulated += chunk
+            r = parser.extract_tool_calls_streaming(
+                previous_text=prev,
+                current_text=accumulated,
+                delta_text=chunk,
+            )
+            if r is not None and "tool_calls" in r:
+                tool_calls_found = True
+                assert r["tool_calls"][0]["function"]["name"] == "get_weather"
+                break
+        assert tool_calls_found
+
+    def test_streaming_bracket_call_closing_marker_split(self, parser):
+        """Qwen bracket calls should complete when ')' and ']' split chunks."""
+        chunks = [
+            '[Calling tool: add({"a": 1, "b": 2})',
+            "]",
+        ]
+
+        accumulated = ""
+        emitted = None
+        for chunk in chunks:
+            previous = accumulated
+            accumulated += chunk
+            emitted = parser.extract_tool_calls_streaming(
+                previous_text=previous,
+                current_text=accumulated,
+                delta_text=chunk,
+            )
+
+        assert emitted is not None
+        assert "tool_calls" in emitted
+        assert emitted["tool_calls"][0]["function"]["name"] == "add"
+        assert emitted["tool_calls"][0]["function"]["arguments"] == ('{"a": 1, "b": 2}')
+
+    def test_streaming_partial_marker_buffered(self, parser):
+        """Test that partial '<function' is buffered (not leaked as content)."""
+        r = parser.extract_tool_calls_streaming(
+            previous_text="",
+            current_text="Sure.",
+            delta_text="Sure.",
+        )
+        assert r == {"content": "Sure."}
+
+        # Partial marker "<function" — should be buffered
+        r = parser.extract_tool_calls_streaming(
+            previous_text="Sure.",
+            current_text="Sure.<function",
+            delta_text="<function",
+        )
+        assert r is None  # Buffered, not emitted
+
+        # "=" confirms tool call marker
+        r = parser.extract_tool_calls_streaming(
+            previous_text="Sure.<function",
+            current_text="Sure.<function=get_weather>",
+            delta_text="=get_weather>",
+        )
+        assert r is None  # Inside incomplete function block
+
+    def test_streaming_false_positive_functional(self, parser):
+        """Regression: '<functional' across chunk boundary must NOT be suppressed.
+
+        When a delta contains 'Look at <function', the content before the
+        partial marker ('Look at ') must be emitted immediately. Only the
+        marker suffix is buffered. On recovery, the marker prefix is
+        re-emitted with the next delta so no text is lost.
+        """
+        # Token 1: "Look at <function" — emit "Look at ", buffer "<function"
+        r = parser.extract_tool_calls_streaming(
+            previous_text="",
+            current_text="Look at <function",
+            delta_text="Look at <function",
+        )
+        assert r == {"content": "Look at "}
+
+        # Token 2: "al interface" — confirms it's NOT a tool call
+        r = parser.extract_tool_calls_streaming(
+            previous_text="Look at <function",
+            current_text="Look at <functional interface",
+            delta_text="al interface",
+        )
+        assert r == {"content": "<functional interface"}
+
+    def test_streaming_false_positive_single_angle_bracket(self, parser):
+        """Test that a single '<' followed by non-marker text is recovered."""
+        # "<" alone — partial marker
+        r = parser.extract_tool_calls_streaming(
+            previous_text="Hello",
+            current_text="Hello<",
+            delta_text="<",
+        )
+        assert r is None  # Buffered
+
+        # "div>" — not a tool marker
+        r = parser.extract_tool_calls_streaming(
+            previous_text="Hello<",
+            current_text="Hello<div>",
+            delta_text="div>",
+        )
+        assert r is not None
+        assert "content" in r
+        assert "<" in r["content"]
+        assert "div>" in r["content"]
+
+    def test_streaming_multiple_function_blocks(self, parser):
+        """Test streaming with multiple <function= blocks."""
+        chunks = [
+            '<function=func1>{"a": 1}</function>',
+            "\n",
+            "<function=func2>",
+            "<parameter=b>2</parameter>",
+            "</function>",
+        ]
+        accumulated = ""
+        emitted_calls = []
+        for chunk in chunks:
+            prev = accumulated
+            accumulated += chunk
+            r = parser.extract_tool_calls_streaming(
+                previous_text=prev,
+                current_text=accumulated,
+                delta_text=chunk,
+            )
+            if r is not None and "tool_calls" in r:
+                emitted_calls.extend(r["tool_calls"])
+        assert len(emitted_calls) == 2
+        assert emitted_calls[0]["function"]["name"] == "func1"
+        assert emitted_calls[1]["function"]["name"] == "func2"
+
+
+class TestGLM47ToolParser:
+    """Tests for GLM47 tool parser."""
+
+    def test_zero_arguments_tool_call(self):
+        """Test Fix 2: Handle zero-argument tool calls without crashing."""
+        parser = Glm47ToolParser()
+
+        output = "<tool_call>get_current_time</tool_call>"
+
+        result = parser.extract_tool_calls(output)
+
+        assert result.tools_called is True
+        assert len(result.tool_calls) == 1
+        assert result.tool_calls[0]["name"] == "get_current_time"
+        args = json.loads(result.tool_calls[0]["arguments"])
+        assert args == {}
+
+    def test_with_arguments(self):
+        """Test tool call with arguments."""
+        parser = Glm47ToolParser()
+
+        output = "<tool_call>search\n<arg_key>query</arg_key><arg_value>Python</arg_value></tool_call>"
+
+        result = parser.extract_tool_calls(output)
+
+        assert result.tools_called is True
+        assert len(result.tool_calls) == 1
+        assert result.tool_calls[0]["name"] == "search"
+        args = json.loads(result.tool_calls[0]["arguments"])
+        assert args["query"] == "Python"
+
+    def test_streaming_zero_args(self):
+        """Test Fix 2: Streaming with zero-argument tool call."""
+        parser = Glm47ToolParser()
+
+        chunks = ["<tool_call>", "get_status", "</tool_call>"]
+        accumulated = ""
+        tool_calls_found = False
+
+        for chunk in chunks:
+            prev = accumulated
+            accumulated += chunk
+            r = parser.extract_tool_calls_streaming(
+                previous_text=prev,
+                current_text=accumulated,
+                delta_text=chunk,
+            )
+            if r is not None and "tool_calls" in r:
+                tool_calls_found = True
+                assert r["tool_calls"][0]["function"]["name"] == "get_status"
+                args = json.loads(r["tool_calls"][0]["function"]["arguments"])
+                assert args == {}
+
+        assert tool_calls_found, "Zero-argument tool call should have been detected"

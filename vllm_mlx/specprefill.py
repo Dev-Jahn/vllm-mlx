@@ -155,32 +155,48 @@ def _unpatch_attention_capture(model, originals):
         _set_attn_module(model.layers[layer_idx], orig)
 
 
-def _prefill_draft(model, tokens, cache, step_size=2048):
+def _prefill_draft(model, tokens, cache, step_size=2048, cancel_check=None):
     """Prefill prompt tokens into cache. Returns logits from last token."""
     prompt = mx.array(tokens) if not isinstance(tokens, mx.array) else tokens
     n = len(tokens)
     processed = 0
     while n - processed > 1:
+        if cancel_check is not None:
+            cancel_check()
         chunk = min(step_size, n - processed - 1)
         model(prompt[processed : processed + chunk][None], cache=cache)
         mx.eval([c.state for c in cache])
         processed += chunk
         mx.clear_cache()
+    if cancel_check is not None:
+        cancel_check()
     logits = model(prompt[processed:][None], cache=cache)
     mx.eval(logits)
     return logits
 
 
-def _lookahead_decode(model, first_logits, cache, n_steps, temp=0.6, top_p=0.95):
+def _lookahead_decode(
+    model,
+    first_logits,
+    cache,
+    n_steps,
+    temp=0.6,
+    top_p=0.95,
+    cancel_check=None,
+):
     """Run n_steps autoregressive decode, returning generated token ids.
 
     Query vectors are captured by the monkey-patched attention layers.
     """
     sampler = make_sampler(temp=temp, top_p=top_p)
+    if cancel_check is not None:
+        cancel_check()
     y = sampler(first_logits[:, -1, :])
     mx.eval(y)
     generated = [y.item()]
     for _ in range(n_steps):
+        if cancel_check is not None:
+            cancel_check()
         logits = model(y.reshape(1, -1), cache=cache)
         y = sampler(logits[:, -1, :])
         mx.eval(y)
@@ -264,6 +280,7 @@ def score_tokens(
     top_p=0.95,
     prefill_step_size=2048,
     query_extractor=None,
+    cancel_check=None,
 ):
     """Score token importance using attention-based analysis on a draft model.
 
@@ -308,19 +325,33 @@ def score_tokens(
         attn_obj, "num_key_value_heads", getattr(attn_obj, "n_kv_heads", None)
     )
 
-    # Auto-detect query extractor if not specified
+    # Auto-detect query extractor from model_type (explicit registry, not
+    # attribute sniffing -- avoids silent misclassification on new models).
     if query_extractor is None:
-        if hasattr(attn_obj, "q_norm"):
-            query_extractor = _qwen35_extract_queries
-        elif not hasattr(attn_obj, "rope"):
-            # No RoPE attribute → Nemotron-H style (content-based attention)
-            query_extractor = _nemotron_h_extract_queries
-        else:
-            query_extractor = _llama_extract_queries
+        model_type = getattr(getattr(model, "config", None), "model_type", "")
+        _EXTRACTOR_REGISTRY = {
+            "qwen3_5": _qwen35_extract_queries,
+            "qwen3_5_moe": _qwen35_extract_queries,
+            "qwen3_vl": _qwen35_extract_queries,
+            "qwen3_vl_moe": _qwen35_extract_queries,
+            "nemotron_h": _nemotron_h_extract_queries,
+        }
+        query_extractor = _EXTRACTOR_REGISTRY.get(model_type)
+        if query_extractor is None:
+            if _get_rope(attn_obj) is not None:
+                query_extractor = _llama_extract_queries
+            else:
+                query_extractor = _nemotron_h_extract_queries
 
     # Phase 1: Prefill
     cache = make_prompt_cache(model)
-    logits = _prefill_draft(model, tokens, cache, step_size=prefill_step_size)
+    logits = _prefill_draft(
+        model,
+        tokens,
+        cache,
+        step_size=prefill_step_size,
+        cancel_check=cancel_check,
+    )
 
     # Phase 2: Lookahead decode with query capture
     query_buffer = [[] for _ in range(n_attn_layers)]
@@ -328,7 +359,15 @@ def score_tokens(
         model, query_buffer, query_extractor=query_extractor
     )
     try:
-        _lookahead_decode(model, logits, cache, n_lookahead, temp=temp, top_p=top_p)
+        _lookahead_decode(
+            model,
+            logits,
+            cache,
+            n_lookahead,
+            temp=temp,
+            top_p=top_p,
+            cancel_check=cancel_check,
+        )
         mx.eval(query_buffer)
     finally:
         _unpatch_attention_capture(model, patches)
@@ -338,6 +377,8 @@ def score_tokens(
     # compacted for Nemotron-H where only M/* layers have cache entries)
     layer_to_cache = _build_layer_to_cache_map(model)
     attn_caches = [cache[layer_to_cache[i]] for i in attn_indices]
+    if cancel_check is not None:
+        cancel_check()
     importance = _compute_importance(
         query_buffer,
         attn_caches,
@@ -355,13 +396,14 @@ def score_tokens(
     return importance
 
 
-def select_chunks(importance, keep_pct=0.3, chunk_size=32):
+def select_chunks(importance, keep_pct=0.3, chunk_size=32, backbone_pct=0.0):
     """Select top-k% token chunks by average importance.
 
     Args:
         importance: (M,) per-token importance scores
         keep_pct: fraction of chunks to keep (default 0.3)
         chunk_size: tokens per chunk (default 32)
+        backbone_pct: fraction of chunks reserved for evenly-spaced coverage
 
     Returns:
         sorted mx.array of kept token indices
@@ -371,7 +413,10 @@ def select_chunks(importance, keep_pct=0.3, chunk_size=32):
         return mx.arange(M)
 
     n_chunks = math.ceil(M / chunk_size)
+    target_tokens = max(1, math.ceil(M * keep_pct))
     keep_n = max(1, math.ceil(n_chunks * keep_pct))
+    backbone_n = max(0, math.ceil(n_chunks * backbone_pct)) if backbone_pct > 0 else 0
+    top_n = max(0, keep_n - backbone_n)
 
     chunk_scores = []
     for i in range(n_chunks):
@@ -379,10 +424,39 @@ def select_chunks(importance, keep_pct=0.3, chunk_size=32):
         end = min(start + chunk_size, M)
         chunk_scores.append(mx.mean(importance[start:end]).item())
 
-    top_chunks = sorted(range(n_chunks), key=lambda i: chunk_scores[i], reverse=True)[
-        :keep_n
-    ]
-    top_chunks.sort()
+    selected_chunks = set(
+        sorted(range(n_chunks), key=lambda i: chunk_scores[i], reverse=True)[:top_n]
+    )
+    if backbone_n > 0:
+        if backbone_n >= n_chunks:
+            selected_chunks.update(range(n_chunks))
+        else:
+            for i in range(backbone_n):
+                selected_chunks.add(round(i * (n_chunks - 1) / max(1, backbone_n - 1)))
+
+    def _selected_token_count(chunks):
+        total = 0
+        for chunk_idx in chunks:
+            start = chunk_idx * chunk_size
+            end = min(start + chunk_size, M)
+            total += end - start
+        return total
+
+    if (
+        len(selected_chunks) < keep_n
+        or _selected_token_count(selected_chunks) < target_tokens
+    ):
+        for chunk_idx in sorted(
+            range(n_chunks), key=lambda i: chunk_scores[i], reverse=True
+        ):
+            selected_chunks.add(chunk_idx)
+            if (
+                len(selected_chunks) >= keep_n
+                and _selected_token_count(selected_chunks) >= target_tokens
+            ):
+                break
+
+    top_chunks = sorted(selected_chunks)
 
     indices = []
     for ci in top_chunks:
@@ -565,6 +639,22 @@ def _get_attn_module(layer):
     return None
 
 
+def _get_rope(attn):
+    """Get the RoPE module from an attention layer, or None.
+
+    mlx_lm models use ``self.rope``; mlx_vlm models use ``self.rotary_emb``.
+    """
+    return getattr(attn, "rope", None) or getattr(attn, "rotary_emb", None)
+
+
+def _set_rope(attn, rope_module):
+    """Set the RoPE module on an attention layer."""
+    if hasattr(attn, "rope"):
+        attn.rope = rope_module
+    elif hasattr(attn, "rotary_emb"):
+        attn.rotary_emb = rope_module
+
+
 def _set_attn_module(layer, module):
     """Set the attention module on a layer (self_attn or mixer)."""
     if hasattr(layer, "self_attn"):
@@ -606,7 +696,13 @@ def _build_layer_to_cache_map(model):
 
 
 def sparse_prefill(
-    model, tokens, selected_indices, cache, step_size=2048, position_offset=0
+    model,
+    tokens,
+    selected_indices,
+    cache,
+    step_size=2048,
+    position_offset=0,
+    cancel_check=None,
 ):
     """Prefill the model cache with selected tokens at their original positions.
 
@@ -640,15 +736,15 @@ def sparse_prefill(
 
     M = tokens.shape[0]
 
-    # Detect RotatingKVCache and ensure tail tokens are included.
-    # Models with sliding window attention (e.g., GPT-OSS) use RotatingKVCache
-    # which evicts old entries. We must include the last `max_size` positions
-    # so sliding window layers have valid recent context for decode.
+    # Detect RotatingKVCache and ensure tail tokens are included only when the
+    # prompt actually exceeds the live cache window. If the full prompt still
+    # fits inside ``max_size`` there is no eviction yet, so forcing the entire
+    # tail back in would collapse sparse prefill into dense work.
     max_rotating_size = 0
     for c in cache:
         if type(c).__name__ == "RotatingKVCache":
             max_rotating_size = max(max_rotating_size, getattr(c, "max_size", 0))
-    if max_rotating_size > 0:
+    if max_rotating_size > 0 and M > max_rotating_size:
         tail_start = max(0, M - max_rotating_size)
         tail_indices = set(range(tail_start, M))
         existing = set(selected_indices.tolist())
@@ -673,7 +769,7 @@ def sparse_prefill(
 
     # Check if attention layers use RoPE (Nemotron-H has none)
     first_attn = _get_attn_module(attn_layers[0][1])
-    has_rope = hasattr(first_attn, "rope")
+    has_rope = _get_rope(first_attn) is not None
 
     # Patch RoPE on attention layers for position-mapped prefill
     # (skipped for architectures without RoPE, e.g. Nemotron-H)
@@ -681,9 +777,11 @@ def sparse_prefill(
     if has_rope:
         for layer_idx, layer in attn_layers:
             attn = _get_attn_module(layer)
-            original_ropes[layer_idx] = attn.rope
-            attn.rope = _PositionMappedRoPE(
-                attn.rope, selected_positions, cache_start=cache_start
+            rope = _get_rope(attn)
+            original_ropes[layer_idx] = (attn, rope)
+            _set_rope(
+                attn,
+                _PositionMappedRoPE(rope, selected_positions, cache_start=cache_start),
             )
 
     try:
@@ -692,6 +790,8 @@ def sparse_prefill(
         processed = 0
 
         while n - processed > 1:
+            if cancel_check is not None:
+                cancel_check()
             chunk = min(step_size, n - processed - 1)
             model(prompt[processed : processed + chunk][None], cache=cache)
             mx.eval([c.state for c in cache])
@@ -699,6 +799,8 @@ def sparse_prefill(
             mx.clear_cache()
 
         # Last token → logits
+        if cancel_check is not None:
+            cancel_check()
         logits = model(prompt[processed:][None], cache=cache)
         mx.eval(logits)
 
@@ -716,12 +818,11 @@ def sparse_prefill(
             final_cache_offset = cache_start + N
             adjustment = int(total_prompt_len) - int(final_cache_offset)
             for layer_idx, layer in attn_layers:
-                attn = _get_attn_module(layer)
-                original = original_ropes[layer_idx]
+                attn, original = original_ropes[layer_idx]
                 if adjustment > 0:
-                    attn.rope = _OffsetAdjustedRoPE(original, adjustment)
+                    _set_rope(attn, _OffsetAdjustedRoPE(original, adjustment))
                 else:
-                    attn.rope = original
+                    _set_rope(attn, original)
 
     return logits
 
@@ -735,8 +836,10 @@ def cleanup_rope(model):
     """
     for _, layer in _find_attention_layers(model):
         attn = _get_attn_module(layer)
-        if attn is None or not hasattr(attn, "rope"):
+        if attn is None:
             continue
-        rope = attn.rope
+        rope = _get_rope(attn)
+        if rope is None:
+            continue
         if isinstance(rope, (_OffsetAdjustedRoPE, _PositionMappedRoPE)):
-            attn.rope = rope._original
+            _set_rope(attn, rope._original)

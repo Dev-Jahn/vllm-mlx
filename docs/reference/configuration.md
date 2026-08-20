@@ -6,11 +6,13 @@
 
 | Option | Description | Default |
 |--------|-------------|---------|
-| `--host` | Server host address | `0.0.0.0` |
+| `--host` | Server host address | `127.0.0.1` |
 | `--port` | Server port | `8000` |
 | `--max-tokens` | Default max tokens | `32768` |
+| `--max-request-tokens` | Maximum `max_tokens` accepted from API clients | `32768` |
 | `--default-temperature` | Default temperature when not specified in request | None |
 | `--default-top-p` | Default top_p when not specified in request | None |
+| `--default-chat-template-kwargs` | Default chat template kwargs used when request `chat_template_kwargs` is omitted (JSON object) | None |
 
 ### Security Options
 
@@ -19,6 +21,9 @@
 | `--api-key` | API key for authentication | None |
 | `--rate-limit` | Requests per minute per client (0 = disabled) | `0` |
 | `--timeout` | Request timeout in seconds | `300` |
+| `--enable-metrics` | Expose Prometheus metrics on `/metrics` | `false` |
+| `--max-audio-upload-mb` | Maximum uploaded audio size for `/v1/audio/transcriptions` | `25` |
+| `--max-tts-input-chars` | Maximum text length accepted by `/v1/audio/speech` | `4096` |
 
 ### Batching Options
 
@@ -38,6 +43,9 @@
 | `--use-paged-cache` | Enable paged KV cache | `false` |
 | `--paged-cache-block-size` | Tokens per block | `64` |
 | `--max-cache-blocks` | Maximum blocks | `1000` |
+| `--prefix-trie-cache` | Enable conversation-prefix reuse in pure-LLM SimpleEngine mode | `false` |
+| `--prefix-trie-cache-size` | Maximum SimpleEngine prompt-trie entries | `32` |
+| `--prefix-trie-cache-memory-mb` | Optional SimpleEngine prompt-trie memory cap in MB | None |
 
 ### Tool Calling Options
 

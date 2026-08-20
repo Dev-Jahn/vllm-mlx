@@ -27,6 +27,7 @@ from __future__ import annotations
 import bisect
 import logging
 import math
+import threading
 from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Any
@@ -38,6 +39,9 @@ _BYTES_PER_MB = 1024 * 1024
 _DEFAULT_MEMORY_PERCENT = 0.20  # 20% of available RAM
 _MIN_MEMORY_BYTES = 100 * _BYTES_PER_MB  # Minimum 100MB
 _MAX_ENTRIES_FALLBACK = 50  # Fallback if memory detection fails
+# Bump this when the cache on-disk format or KV semantics change.
+# Loading a cache with a different version is rejected automatically.
+_CACHE_PERSIST_VERSION = 3
 
 
 def _get_available_memory() -> int:
@@ -84,6 +88,23 @@ def _array_memory(arr) -> int:
     return 0
 
 
+def _nested_array_memory(value: Any) -> int:
+    """Sum ``_array_memory`` over an arbitrarily nested state structure.
+
+    Cache ``state`` payloads are not always a flat ``(keys, values)`` pair:
+    CacheList yields a list of sub-cache states and PoolingCache yields
+    ``(buf_kv, buf_gate, pooled)`` with possible ``None`` members. Unpacking
+    those as two values raised, was swallowed, and the entry was accounted as
+    zero bytes — so the dashboard showed 0% cache memory and, far worse, the
+    byte-based LRU eviction never fired for such models.
+    """
+    if value is None:
+        return 0
+    if isinstance(value, (list, tuple)):
+        return sum(_nested_array_memory(v) for v in value)
+    return _array_memory(value)
+
+
 def estimate_kv_cache_memory(cache: list[Any]) -> int:
     """
     Estimate memory usage of a KV cache in bytes.
@@ -121,11 +142,11 @@ def estimate_kv_cache_memory(cache: list[Any]) -> int:
                 total_bytes += _array_memory(arr)
             continue
         elif hasattr(layer_cache, "state") and not isinstance(layer_cache, dict):
-            # Cache with state property returning (keys, values)
+            # Cache with a state property. Walk it recursively: the payload may
+            # be a plain (keys, values) pair, but CacheList/PoolingCache nest
+            # further, and the old two-way unpack silently measured those as 0.
             try:
-                keys, values = layer_cache.state
-                total_bytes += _array_memory(keys)
-                total_bytes += _array_memory(values)
+                total_bytes += _nested_array_memory(layer_cache.state)
             except (TypeError, ValueError):
                 pass
         elif hasattr(layer_cache, "keys") and hasattr(layer_cache, "values"):
@@ -155,6 +176,7 @@ class MemoryCacheConfig:
         kv_bits: Number of bits for KV cache quantization.
         kv_group_size: Group size for KV cache quantization.
         kv_min_quantize_tokens: Minimum sequence length for quantization to apply.
+        min_prefix_tokens: Minimum cached prefix length eligible for reuse.
     """
 
     max_memory_mb: int | None = None
@@ -165,6 +187,7 @@ class MemoryCacheConfig:
     kv_bits: int = 8
     kv_group_size: int = 64
     kv_min_quantize_tokens: int = 256
+    min_prefix_tokens: int = 128
 
     def __post_init__(self) -> None:
         if not 0.0 < self.max_memory_percent <= 1.0:
@@ -176,6 +199,10 @@ class MemoryCacheConfig:
         if self.kv_min_quantize_tokens < 0:
             raise ValueError(
                 f"kv_min_quantize_tokens must be >= 0, got {self.kv_min_quantize_tokens}"
+            )
+        if self.min_prefix_tokens < 1:
+            raise ValueError(
+                f"min_prefix_tokens must be >= 1, got {self.min_prefix_tokens}"
             )
 
     def compute_memory_limit(self) -> int:
@@ -254,45 +281,197 @@ class _CacheEntry:
         )
 
 
+def _is_cache_layer_trimmable(layer_cache: Any) -> bool:
+    """Return whether a cache layer can safely be rewound for partial reuse."""
+    if isinstance(layer_cache, _QuantizedCacheWrapper):
+        if "max_size" in layer_cache.orig_attrs:
+            return False
+        return hasattr(layer_cache, "offset") and hasattr(layer_cache, "keys")
+
+    # _trim_cache_offset does not currently rewind container children.
+    if hasattr(layer_cache, "caches"):
+        return False
+
+    is_trimmable = getattr(layer_cache, "is_trimmable", None)
+    if callable(is_trimmable):
+        try:
+            return bool(is_trimmable())
+        except Exception:
+            logger.debug(
+                "Failed to check cache layer trimmability for %s",
+                type(layer_cache).__name__,
+                exc_info=True,
+            )
+            return False
+
+    # Compatibility fallback for simple KV-like cache implementations.
+    return hasattr(layer_cache, "offset") and hasattr(layer_cache, "keys")
+
+
 def _trim_cache_offset(cache: list[Any], trim_by: int) -> list[Any]:
-    """Create shallow copies of KVCache/QuantizedKVCache layers with offset reduced.
+    """Create copies of cache layers with the last ``trim_by`` positions removed.
 
     This is used when returning a cached KV state to the scheduler so that
     the last N positions are "freed" and the model will recompute them on the
     next forward pass (preventing duplicate KV entries).
 
-    Supports both KVCache (keys/values are arrays) and QuantizedKVCache
-    (keys/values are 3-tuples of arrays).
-    """
-    from mlx_lm.models.cache import KVCache
+    For plain KVCache: reduces offset (surplus data beyond offset is harmless
+    since merge slices to ``keys[:, :, :offset, :]``).
 
-    try:
-        from mlx_lm.models.cache import QuantizedKVCache
-    except ImportError:
-        QuantizedKVCache = None  # noqa: N806
+    For RotatingKVCache: actually trims the circular buffer — reducing offset
+    alone breaks ``size()`` / ``_temporal_order`` invariants.
+
+    Supports KVCache, RotatingKVCache, and _QuantizedCacheWrapper.
+    """
+    import mlx.core as mx
+    from mlx_lm.models.cache import RotatingKVCache
 
     trimmed: list[Any] = []
+    eval_targets: list[Any] = []
     for layer_cache in cache:
-        if QuantizedKVCache is not None and isinstance(layer_cache, QuantizedKVCache):
-            tc = QuantizedKVCache.__new__(QuantizedKVCache)
+        if isinstance(layer_cache, _QuantizedCacheWrapper):
+            # Shallow copy with reduced offset
+            tc = _QuantizedCacheWrapper.__new__(_QuantizedCacheWrapper)
             tc.keys = layer_cache.keys
             tc.values = layer_cache.values
             tc.offset = max(layer_cache.offset - trim_by, 0)
-            tc.group_size = layer_cache.group_size
             tc.bits = layer_cache.bits
+            tc.group_size = layer_cache.group_size
+            tc.orig_type = layer_cache.orig_type
+            tc.orig_attrs = layer_cache.orig_attrs
+            trimmed.append(tc)
+        elif isinstance(layer_cache, RotatingKVCache):
+            if layer_cache.keys is None or trim_by <= 0:
+                trimmed.append(layer_cache)
+                continue
+            # RotatingKVCache: must trim buffer, not just offset.
+            # The buffer stores the last min(offset, max_size) tokens in a
+            # circular arrangement.  Trimming excess positions from the END
+            # means removing the newest entries (chronologically last).
+            old_offset = layer_cache.offset
+            new_offset = max(old_offset - trim_by, 0)
+            old_size = min(old_offset, layer_cache.max_size)
+            entries_to_keep = max(0, old_size - trim_by)
+
+            orig_cls = type(layer_cache)
+            tc = orig_cls.__new__(orig_cls)
+            tc.offset = new_offset
+            tc.max_size = layer_cache.max_size
+            tc.keep = getattr(layer_cache, "keep", 0)
+            tc.step = getattr(layer_cache, "step", layer_cache.max_size)
+
+            if entries_to_keep <= 0:
+                # All buffer content is beyond the trim point — clear
+                tc.keys = None
+                tc.values = None
+                tc._idx = 0
+                tc.offset = 0
+            elif entries_to_keep < old_size:
+                # Reorder to temporal order, keep the oldest entries
+                ordered_k = layer_cache._temporal_order(layer_cache.keys)
+                ordered_v = layer_cache._temporal_order(layer_cache.values)
+                kept_k = ordered_k[:, :, :entries_to_keep, :]
+                kept_v = ordered_v[:, :, :entries_to_keep, :]
+
+                if new_offset >= tc.max_size:
+                    # Invariant: when offset >= max_size, buffer must be
+                    # full (keys.shape[2] == max_size).  Left-pad with
+                    # zeros to restore the full buffer.  Zeros represent
+                    # positions evicted long ago; _idx = max_size so
+                    # _temporal_order returns as-is and _update_in_place
+                    # rotates to overwrite zeros first.
+                    pad_n = tc.max_size - entries_to_keep
+                    pad_k = mx.zeros(
+                        (kept_k.shape[0], kept_k.shape[1], pad_n, kept_k.shape[3]),
+                        dtype=kept_k.dtype,
+                    )
+                    pad_v = mx.zeros(
+                        (kept_v.shape[0], kept_v.shape[1], pad_n, kept_v.shape[3]),
+                        dtype=kept_v.dtype,
+                    )
+                    tc.keys = mx.concatenate([pad_k, kept_k], axis=2)
+                    tc.values = mx.concatenate([pad_v, kept_v], axis=2)
+                    tc._idx = tc.max_size
+                else:
+                    if entries_to_keep < new_offset:
+                        # Buffer has fewer entries than offset requires.
+                        # This happens when old_offset > max_size (rotating)
+                        # and the trim brought new_offset below max_size.
+                        # Pad with zeros on the left to maintain the invariant
+                        # size() == keys.shape[2], preventing merge crashes.
+                        pad_n = new_offset - entries_to_keep
+                        pad_k = mx.zeros(
+                            (
+                                kept_k.shape[0],
+                                kept_k.shape[1],
+                                pad_n,
+                                kept_k.shape[3],
+                            ),
+                            dtype=kept_k.dtype,
+                        )
+                        pad_v = mx.zeros(
+                            (
+                                kept_v.shape[0],
+                                kept_v.shape[1],
+                                pad_n,
+                                kept_v.shape[3],
+                            ),
+                            dtype=kept_v.dtype,
+                        )
+                        tc.keys = mx.concatenate([pad_k, kept_k], axis=2)
+                        tc.values = mx.concatenate([pad_v, kept_v], axis=2)
+                        tc._idx = new_offset
+                    else:
+                        tc.keys = kept_k
+                        tc.values = kept_v
+                        tc._idx = entries_to_keep
+                eval_targets.extend([tc.keys, tc.values])
+            else:
+                # No entries removed (trim_by == 0 already handled above,
+                # this covers entries_to_keep == old_size edge case)
+                tc.keys = layer_cache.keys
+                tc.values = layer_cache.values
+                tc._idx = layer_cache._idx
             trimmed.append(tc)
         elif (
             hasattr(layer_cache, "offset")
             and hasattr(layer_cache, "keys")
             and not isinstance(layer_cache.keys, (list, tuple))
         ):
-            tc = KVCache.__new__(KVCache)
-            tc.keys = layer_cache.keys
-            tc.values = layer_cache.values
-            tc.offset = max(layer_cache.offset - trim_by, 0)
+            orig_cls = type(layer_cache)
+            tc = orig_cls.__new__(orig_cls)
+            new_offset = max(layer_cache.offset - trim_by, 0)
+            keys = layer_cache.keys
+            values = layer_cache.values
+            # Slice the arrays down to new_offset rather than just shrinking the
+            # offset pointer.  Sharing the original (over-sized) array across
+            # requests lets attention paths that read the full underlying
+            # buffer (e.g. Gemma 4's KV-shared layers, which read cache.state
+            # directly instead of going through update_and_fetch) see stale
+            # tokens from the previous owner — issue #384.
+            if (
+                keys is not None
+                and hasattr(keys, "shape")
+                and len(keys.shape) >= 3
+                and new_offset < keys.shape[-2]
+            ):
+                tc.keys = keys[..., :new_offset, :]
+                tc.values = values[..., :new_offset, :]
+            else:
+                tc.keys = keys
+                tc.values = values
+            tc.offset = new_offset
+            # Preserve type-specific attrs (max_size, keep, step, _idx)
+            for attr in ("max_size", "keep", "step", "_idx"):
+                if hasattr(layer_cache, attr):
+                    setattr(tc, attr, getattr(layer_cache, attr))
             trimmed.append(tc)
         else:
             trimmed.append(layer_cache)
+
+    if eval_targets:
+        mx.eval(*eval_targets)
+
     return trimmed
 
 
@@ -353,28 +532,72 @@ def _trim_to_offset(cache: list[Any]) -> list[Any]:
     return trimmed
 
 
+class _QuantizedCacheWrapper:
+    """Lightweight wrapper storing quantized KV arrays + original cache metadata.
+
+    Unlike ``QuantizedKVCache``, this preserves enough info to reconstruct
+    the *original* cache type (KVCache, RotatingKVCache, etc.) on dequantize.
+    """
+
+    __slots__ = (
+        "keys",
+        "values",
+        "offset",
+        "bits",
+        "group_size",
+        "orig_type",
+        "orig_attrs",
+    )
+
+    def __init__(self, layer: Any, bits: int, group_size: int):
+        import mlx.core as mx
+
+        self.keys = mx.quantize(layer.keys, group_size=group_size, bits=bits)
+        self.values = mx.quantize(layer.values, group_size=group_size, bits=bits)
+        self.offset = layer.offset
+        self.bits = bits
+        self.group_size = group_size
+        self.orig_type = type(layer)
+        # Preserve RotatingKVCache-specific attrs
+        self.orig_attrs = {}
+        for attr in ("max_size", "keep", "step", "_idx"):
+            if hasattr(layer, attr):
+                self.orig_attrs[attr] = getattr(layer, attr)
+
+
 def _quantize_cache(cache: list[Any], bits: int = 8, group_size: int = 64) -> list[Any]:
-    """Quantize KVCache layers to reduce memory. Non-KVCache layers are kept as-is."""
+    """Quantize KV cache layers to reduce memory.
+
+    Only plain KVCache layers are quantized. RotatingKVCache (sliding window)
+    is left as-is because its internal _idx/rotation state is tightly coupled
+    with update_and_fetch logic and cannot survive quantize/dequantize roundtrip.
+    RotatingKVCache is typically small (max_size=1024) so skipping it is fine.
+    """
     from mlx_lm.models.cache import KVCache
 
     quantized = []
     for layer in cache:
-        if isinstance(layer, KVCache) and layer.keys is not None:
-            quantized.append(layer.to_quantized(group_size=group_size, bits=bits))
+        if type(layer) is KVCache and getattr(layer, "keys", None) is not None:
+            quantized.append(_QuantizedCacheWrapper(layer, bits, group_size))
         else:
             quantized.append(layer)
     return quantized
 
 
 def _dequantize_cache(cache: list[Any]) -> list[Any]:
-    """Dequantize QuantizedKVCache layers back to regular KVCache."""
+    """Dequantize _QuantizedCacheWrapper layers and copy non-quantized layers.
+
+    All layers are copied (never returned by reference) so that the model's
+    ``update_and_fetch`` mutations don't corrupt the stored cache entry.
+    """
     import mlx.core as mx
-    from mlx_lm.models.cache import KVCache, QuantizedKVCache
 
     result = []
     for layer in cache:
-        if isinstance(layer, QuantizedKVCache) and layer.keys is not None:
-            kv = KVCache()
+        if isinstance(layer, _QuantizedCacheWrapper):
+            # Reconstruct original cache type from quantized data
+            orig_cls = layer.orig_type
+            kv = orig_cls.__new__(orig_cls)
             kv.keys = mx.dequantize(
                 *layer.keys, group_size=layer.group_size, bits=layer.bits
             )
@@ -382,10 +605,75 @@ def _dequantize_cache(cache: list[Any]) -> list[Any]:
                 *layer.values, group_size=layer.group_size, bits=layer.bits
             )
             kv.offset = layer.offset
+            # Slice the dequantized arrays down to offset so that readers
+            # which bypass offset (e.g. Gemma 4 KV-shared layers reading
+            # cache.state directly) cannot see stale tokens from a previous
+            # request.  Mirrors the plain-KVCache slice in
+            # _trim_cache_offset — see issue #384.
+            if (
+                kv.keys is not None
+                and hasattr(kv.keys, "shape")
+                and len(kv.keys.shape) >= 3
+                and kv.offset < kv.keys.shape[-2]
+            ):
+                kv.keys = kv.keys[..., : kv.offset, :]
+                kv.values = kv.values[..., : kv.offset, :]
+            # Restore type-specific attrs (max_size, keep, step, _idx)
+            for attr, val in layer.orig_attrs.items():
+                setattr(kv, attr, val)
+            result.append(kv)
+        elif hasattr(layer, "keys") and hasattr(layer, "offset"):
+            # Deep-copy non-quantized cache layers (e.g. RotatingKVCache)
+            # so model's in-place mutations don't corrupt stored entries
+            orig_cls = type(layer)
+            kv = orig_cls.__new__(orig_cls)
+            kv.keys = mx.array(layer.keys) if layer.keys is not None else None
+            kv.values = mx.array(layer.values) if layer.values is not None else None
+            kv.offset = layer.offset
+            for attr in ("max_size", "keep", "step", "_idx"):
+                if hasattr(layer, attr):
+                    setattr(kv, attr, getattr(layer, attr))
             result.append(kv)
         else:
             result.append(layer)
     return result
+
+
+def _compute_model_fingerprint(model: Any) -> str:
+    """Compute a fingerprint from model architecture for cache compatibility.
+
+    Used to reject disk-persisted caches created by a different model or
+    a different quantisation of the same model.  The fingerprint is a
+    short hex digest of (num_layers, hidden_size, vocab_size, num_kv_heads,
+    head_dim) — lightweight and deterministic.
+    """
+    import hashlib
+
+    parts: list[str] = []
+    # Walk model.config / model.args / direct attributes
+    for cfg_attr in ("config", "args", "model_config"):
+        cfg = getattr(model, cfg_attr, None)
+        if cfg is not None:
+            break
+    if cfg is None:
+        cfg = model  # fallback: attributes on the model itself
+
+    for key in (
+        "num_hidden_layers",
+        "hidden_size",
+        "vocab_size",
+        "num_key_value_heads",
+        "head_dim",
+        "intermediate_size",
+        "model_type",
+    ):
+        val = getattr(cfg, key, None)
+        if val is not None:
+            parts.append(f"{key}={val}")
+
+    fingerprint = hashlib.sha256("|".join(parts).encode()).hexdigest()[:16]
+    logger.debug(f"[model_fingerprint] {fingerprint} ({', '.join(parts)})")
+    return fingerprint
 
 
 class MemoryAwarePrefixCache:
@@ -420,6 +708,7 @@ class MemoryAwarePrefixCache:
         """
         self._model_id = id(model)
         self._config = config or MemoryCacheConfig()
+        self._model_fingerprint = _compute_model_fingerprint(model)
 
         # OrderedDict maintains insertion order for LRU
         # Key: tuple(tokens), Value: _CacheEntry
@@ -433,12 +722,16 @@ class MemoryAwarePrefixCache:
         # Memory tracking
         self._max_memory = self._config.compute_memory_limit()
         self._current_memory = 0
+        self._memory_lock = threading.RLock()
 
         # Statistics
         self._stats = CacheStats(max_memory_bytes=self._max_memory)
 
         # Track the match type from the last fetch() call
         self._last_match_type: str | None = None
+
+        # Optional SSD cold tier (set via set_ssd_tier())
+        self._ssd_tier = None
 
         logger.info(
             f"MemoryAwarePrefixCache initialized: "
@@ -468,6 +761,10 @@ class MemoryAwarePrefixCache:
         if not tokens:
             self._stats.misses += 1
             self._last_match_type = "miss"
+            return None, tokens
+        if len(tokens) < self._config.min_prefix_tokens:
+            self._stats.misses += 1
+            self._last_match_type = "miss_short_prefix"
             return None, tokens
 
         tokens_key = tuple(tokens)
@@ -539,8 +836,7 @@ class MemoryAwarePrefixCache:
             excess = n_cached - n_requested
 
             has_non_trimmable = any(
-                not (hasattr(lc, "offset") and hasattr(lc, "keys"))
-                for lc in best_super.cache
+                not _is_cache_layer_trimmable(lc) for lc in best_super.cache
             )
 
             if excess > 0 and has_non_trimmable:
@@ -621,11 +917,19 @@ class MemoryAwarePrefixCache:
                     )
 
         if best_lcp_entry is not None and best_lcp_length > 0:
+            if best_lcp_length < self._config.min_prefix_tokens:
+                logger.debug(
+                    "[cache_fetch] LCP skipped: shared=%s below min_prefix_tokens=%s",
+                    best_lcp_length,
+                    self._config.min_prefix_tokens,
+                )
+                self._stats.misses += 1
+                self._last_match_type = "miss_short_lcp"
+                return None, tokens
             excess = len(best_lcp_entry.tokens) - best_lcp_length
 
             has_non_trimmable = any(
-                not (hasattr(lc, "offset") and hasattr(lc, "keys"))
-                for lc in best_lcp_entry.cache
+                not _is_cache_layer_trimmable(lc) for lc in best_lcp_entry.cache
             )
             logger.debug(
                 f"[cache_fetch] LCP candidate: lcp={best_lcp_length} "
@@ -635,7 +939,15 @@ class MemoryAwarePrefixCache:
                 f"layer_types={[type(lc).__name__ for lc in best_lcp_entry.cache[:3]]}"
             )
 
-            if not has_non_trimmable:
+            if has_non_trimmable:
+                # Hybrid model (SSM+Attention): SSM state can't be rewound.
+                # Block LCP for hybrid models — use think-suffix stripping
+                # in the engine layer to get clean PREFIX matches instead.
+                logger.debug(
+                    "[cache_fetch] LCP skipped: non-trimmable cache layers "
+                    "(hybrid model, SSM state can't be rewound)"
+                )
+            else:
                 trimmed_cache = _trim_cache_offset(best_lcp_entry.cache, excess)
                 self._entries.move_to_end(best_lcp_entry.tokens)
                 self._stats.hits += 1
@@ -682,80 +994,88 @@ class MemoryAwarePrefixCache:
         """
         if not tokens or not cache:
             return False
-
-        tokens_key = tuple(tokens)
-
-        # If already cached, just update LRU order (skip expensive trim/quantize)
-        if tokens_key in self._entries:
-            self._entries.move_to_end(tokens_key)
-            return True
-
-        # Trim oversized KV arrays to actual used size
-        cache = _trim_to_offset(cache)
-
-        # Quantize if enabled and sequence is long enough
-        if (
-            self._config.kv_quantize
-            and len(tokens) >= self._config.kv_min_quantize_tokens
-        ):
-            cache = _quantize_cache(
-                cache, self._config.kv_bits, self._config.kv_group_size
-            )
-
-        # Create entry and estimate memory
-        entry = _CacheEntry.create(tokens, cache)
-
-        # Check if single entry exceeds limit
-        if entry.memory_bytes > self._max_memory:
-            logger.warning(
-                f"Cache entry too large: {entry.memory_bytes / _BYTES_PER_MB:.1f}MB "
-                f"exceeds limit {self._max_memory / _BYTES_PER_MB:.1f}MB"
+        if len(tokens) < self._config.min_prefix_tokens:
+            logger.debug(
+                "[cache_store] skipped short prefix: tokens=%s min_prefix_tokens=%s",
+                len(tokens),
+                self._config.min_prefix_tokens,
             )
             return False
 
-        # Prefix-subset eviction: remove entries whose token sequence
-        # is a strict prefix of the new entry.  Uses sorted index for
-        # O(log N + K) lookup instead of O(N) scan.
-        if evict_prefixes and self._sorted_keys:
-            to_remove = []
-            idx = bisect.bisect_left(self._sorted_keys, tokens_key)
-            # Scan backwards — prefixes of tokens_key are immediately before idx
-            for i in range(idx - 1, -1, -1):
-                key = self._sorted_keys[i]
-                klen = len(key)
-                if klen >= len(tokens_key):
-                    continue
-                if tokens_key[:klen] == key:
-                    to_remove.append(key)
-                elif key[0] != tokens_key[0]:
-                    break
-            for key in to_remove:
-                old = self._entries.pop(key)
-                self._current_memory -= old.memory_bytes
-                self._stats.evictions += 1
-                self._remove_from_sorted(key)
-                logger.debug(
-                    f"[prefix_evict] removed {len(key)} tokens, "
-                    f"freed {old.memory_bytes / _BYTES_PER_MB:.2f}MB, "
-                    f"new_entry={len(tokens_key)} tokens"
+        with self._memory_lock:
+            tokens_key = tuple(tokens)
+
+            # If already cached, just update LRU order (skip expensive trim/quantize)
+            if tokens_key in self._entries:
+                self._entries.move_to_end(tokens_key)
+                return True
+
+            # Trim oversized KV arrays to actual used size
+            cache = _trim_to_offset(cache)
+
+            # Quantize if enabled and sequence is long enough
+            if (
+                self._config.kv_quantize
+                and len(tokens) >= self._config.kv_min_quantize_tokens
+            ):
+                cache = _quantize_cache(
+                    cache, self._config.kv_bits, self._config.kv_group_size
                 )
-            if to_remove:
-                self._stats.entry_count = len(self._entries)
-                self._stats.current_memory_bytes = self._current_memory
 
-        # Evict until we have room
-        while (
-            self._current_memory + entry.memory_bytes > self._max_memory
-            or len(self._entries) >= self._config.max_entries
-        ) and self._entries:
-            self._evict_lru()
+            # Create entry and estimate memory
+            entry = _CacheEntry.create(tokens, cache)
 
-        # Store entry
-        self._entries[tokens_key] = entry
-        self._current_memory += entry.memory_bytes
-        bisect.insort(self._sorted_keys, tokens_key)
-        self._stats.entry_count = len(self._entries)
-        self._stats.current_memory_bytes = self._current_memory
+            # Check if single entry exceeds limit
+            if entry.memory_bytes > self._max_memory:
+                logger.warning(
+                    f"Cache entry too large: {entry.memory_bytes / _BYTES_PER_MB:.1f}MB "
+                    f"exceeds limit {self._max_memory / _BYTES_PER_MB:.1f}MB"
+                )
+                return False
+
+            # Prefix-subset eviction: remove entries whose token sequence
+            # is a strict prefix of the new entry.  Uses sorted index for
+            # O(log N + K) lookup instead of O(N) scan.
+            if evict_prefixes and self._sorted_keys:
+                to_remove = []
+                idx = bisect.bisect_left(self._sorted_keys, tokens_key)
+                # Scan backwards — prefixes of tokens_key are immediately before idx
+                for i in range(idx - 1, -1, -1):
+                    key = self._sorted_keys[i]
+                    klen = len(key)
+                    if klen >= len(tokens_key):
+                        continue
+                    if tokens_key[:klen] == key:
+                        to_remove.append(key)
+                    elif key[0] != tokens_key[0]:
+                        break
+                for key in to_remove:
+                    old = self._entries.pop(key)
+                    self._current_memory -= old.memory_bytes
+                    self._stats.evictions += 1
+                    self._remove_from_sorted(key)
+                    logger.debug(
+                        f"[prefix_evict] removed {len(key)} tokens, "
+                        f"freed {old.memory_bytes / _BYTES_PER_MB:.2f}MB, "
+                        f"new_entry={len(tokens_key)} tokens"
+                    )
+                if to_remove:
+                    self._stats.entry_count = len(self._entries)
+                    self._stats.current_memory_bytes = self._current_memory
+
+            # Evict until we have room
+            while (
+                self._current_memory + entry.memory_bytes > self._max_memory
+                or len(self._entries) >= self._config.max_entries
+            ) and self._entries:
+                self._evict_lru()
+
+            # Store entry
+            self._entries[tokens_key] = entry
+            self._current_memory += entry.memory_bytes
+            bisect.insort(self._sorted_keys, tokens_key)
+            self._stats.entry_count = len(self._entries)
+            self._stats.current_memory_bytes = self._current_memory
 
         logger.debug(
             f"Stored cache: {len(tokens)} tokens, "
@@ -772,21 +1092,31 @@ class MemoryAwarePrefixCache:
             self._sorted_keys.pop(idx)
 
     def _evict_lru(self) -> None:
-        """Evict the least recently used entry."""
-        if not self._entries:
-            return
+        """Evict the least recently used entry.
 
-        # popitem(last=False) removes oldest entry (FIFO order = LRU)
-        tokens_key, entry = self._entries.popitem(last=False)
-        self._current_memory -= entry.memory_bytes
-        self._remove_from_sorted(tokens_key)
-        self._stats.evictions += 1
-        self._stats.entry_count = len(self._entries)
-        self._stats.current_memory_bytes = self._current_memory
+        If an SSD tier is attached, the entry is spilled to disk instead
+        of being discarded.
+        """
+        with self._memory_lock:
+            if not self._entries:
+                return
+
+            # popitem(last=False) removes oldest entry (FIFO order = LRU)
+            tokens_key, entry = self._entries.popitem(last=False)
+            self._current_memory -= entry.memory_bytes
+            self._remove_from_sorted(tokens_key)
+            self._stats.evictions += 1
+            self._stats.entry_count = len(self._entries)
+            self._stats.current_memory_bytes = self._current_memory
+
+        # Spill to SSD tier if available
+        if self._ssd_tier is not None:
+            self._ssd_tier.enqueue_spill(tokens_key, entry.cache, entry.memory_bytes)
 
         logger.debug(
             f"[lru_evict] removed {len(tokens_key)} tokens, "
             f"freed {entry.memory_bytes / _BYTES_PER_MB:.2f}MB"
+            f"{'  (spilled to SSD)' if self._ssd_tier is not None else ''}"
         )
 
     def remove(self, tokens: list[int]) -> bool:
@@ -799,22 +1129,24 @@ class MemoryAwarePrefixCache:
         Returns:
             True if entry was found and removed.
         """
-        tokens_key = tuple(tokens)
-        entry = self._entries.pop(tokens_key, None)
-        if entry is not None:
-            self._current_memory -= entry.memory_bytes
-            self._remove_from_sorted(tokens_key)
-            self._stats.entry_count = len(self._entries)
-            self._stats.current_memory_bytes = self._current_memory
-            return True
-        return False
+        with self._memory_lock:
+            tokens_key = tuple(tokens)
+            entry = self._entries.pop(tokens_key, None)
+            if entry is not None:
+                self._current_memory -= entry.memory_bytes
+                self._remove_from_sorted(tokens_key)
+                self._stats.entry_count = len(self._entries)
+                self._stats.current_memory_bytes = self._current_memory
+                return True
+            return False
 
     def clear(self) -> None:
         """Clear all cached entries."""
-        self._entries.clear()
-        self._sorted_keys.clear()
-        self._current_memory = 0
-        self._stats = CacheStats(max_memory_bytes=self._max_memory)
+        with self._memory_lock:
+            self._entries.clear()
+            self._sorted_keys.clear()
+            self._current_memory = 0
+            self._stats = CacheStats(max_memory_bytes=self._max_memory)
         logger.debug("Cache cleared")
 
     def get_stats(self) -> dict[str, Any]:
@@ -823,11 +1155,12 @@ class MemoryAwarePrefixCache:
 
     def reset_stats(self) -> None:
         """Reset statistics while preserving cache contents."""
-        self._stats = CacheStats(
-            max_memory_bytes=self._max_memory,
-            current_memory_bytes=self._current_memory,
-            entry_count=len(self._entries),
-        )
+        with self._memory_lock:
+            self._stats = CacheStats(
+                max_memory_bytes=self._max_memory,
+                current_memory_bytes=self._current_memory,
+                entry_count=len(self._entries),
+            )
 
     @property
     def memory_usage_mb(self) -> float:
@@ -839,6 +1172,21 @@ class MemoryAwarePrefixCache:
         """Memory limit in MB."""
         return self._max_memory / _BYTES_PER_MB
 
+    def try_reserve_memory(self, nbytes: int) -> bool:
+        """Tentatively reserve cache memory for an upcoming promotion."""
+        with self._memory_lock:
+            if self._current_memory + nbytes > self._max_memory:
+                return False
+            self._current_memory += nbytes
+            self._stats.current_memory_bytes = self._current_memory
+            return True
+
+    def release_reserved_memory(self, nbytes: int) -> None:
+        """Release memory previously reserved by try_reserve_memory()."""
+        with self._memory_lock:
+            self._current_memory = max(0, self._current_memory - nbytes)
+            self._stats.current_memory_bytes = self._current_memory
+
     def __len__(self) -> int:
         """Return number of cached entries."""
         return len(self._entries)
@@ -846,6 +1194,53 @@ class MemoryAwarePrefixCache:
     def __contains__(self, tokens: list[int]) -> bool:
         """Check if tokens are cached."""
         return tuple(tokens) in self._entries
+
+    def set_ssd_tier(self, ssd_tier) -> None:
+        """Attach an SSD cache tier for eviction spilling.
+
+        When set, evicted entries are spilled to SSD instead of discarded.
+
+        Args:
+            ssd_tier: An SSDCacheTier instance (or None to disable).
+        """
+        self._ssd_tier = ssd_tier
+        if ssd_tier is not None:
+            logger.info("[memory_cache] SSD tier attached for eviction spilling")
+
+    def check_ssd(self, tokens: list[int]) -> dict | None:
+        """Check if tokens have an SSD cache hit (without reading data).
+
+        Returns metadata dict with 'match_type' ('exact' or 'prefix') if
+        found in SSD tier, None if not found. For prefix matches, the dict
+        also includes 'matched_tokens' (the count of tokens the SSD entry
+        covers).
+
+        This is a fast synchronous call (SQLite lookup only).
+        The actual data read happens via the scheduler handoff.
+        """
+        if self._ssd_tier is None:
+            return None
+
+        tokens_key = tuple(tokens)
+
+        # If already in RAM, no SSD needed
+        if tokens_key in self._entries:
+            return None
+
+        # Check SSD tier — exact match first, then prefix
+        candidate = self._ssd_tier.lookup_ssd(tokens_key)
+        if candidate is not None:
+            candidate["match_type"] = "exact"
+            candidate["matched_tokens"] = len(tokens)
+            return candidate
+
+        prefix = self._ssd_tier.lookup_ssd_prefix(tokens_key)
+        if prefix is not None:
+            prefix["match_type"] = "prefix"
+            prefix["matched_tokens"] = prefix["num_tokens"]
+            return prefix
+
+        return None
 
     # -----------------------------------------------------------------
     # Disk persistence — survives server restarts
@@ -882,7 +1277,8 @@ class MemoryAwarePrefixCache:
             return False
 
         index = {
-            "version": 2,
+            "version": _CACHE_PERSIST_VERSION,
+            "model_fingerprint": self._model_fingerprint,
             "num_entries": len(self._entries),
             "total_memory_bytes": self._current_memory,
             "entries": [],
@@ -892,9 +1288,18 @@ class MemoryAwarePrefixCache:
         for i, (tokens_key, entry) in enumerate(self._entries.items()):
             entry_path = os.path.join(cache_dir, f"entry_{i}.safetensors")
             try:
+                # Dequantize _QuantizedCacheWrapper layers before saving.
+                # save_prompt_cache requires .state and .meta_state which
+                # the wrapper does not provide; dequantizing restores the
+                # original cache types that do.
+                persist_cache = (
+                    _dequantize_cache(entry.cache)
+                    if any(isinstance(c, _QuantizedCacheWrapper) for c in entry.cache)
+                    else entry.cache
+                )
                 save_prompt_cache(
                     entry_path,
-                    entry.cache,
+                    persist_cache,
                     metadata={"num_tokens": str(len(tokens_key))},
                 )
                 # Save tokens separately (can be 100K+ ints → binary is smaller)
@@ -960,8 +1365,20 @@ class MemoryAwarePrefixCache:
             index = json.load(f)
 
         version = index.get("version", 1)
-        if version < 2:
-            logger.warning(f"[cache_persist] unsupported version {version}, skipping")
+        if version != _CACHE_PERSIST_VERSION:
+            logger.warning(
+                f"[cache_persist] version mismatch: disk={version} "
+                f"current={_CACHE_PERSIST_VERSION}, discarding stale cache"
+            )
+            return 0
+
+        disk_fp = index.get("model_fingerprint", "")
+        if disk_fp and disk_fp != self._model_fingerprint:
+            logger.warning(
+                f"[cache_persist] model fingerprint mismatch: "
+                f"disk={disk_fp} current={self._model_fingerprint}, "
+                f"discarding incompatible cache"
+            )
             return 0
 
         loaded = 0
@@ -982,6 +1399,15 @@ class MemoryAwarePrefixCache:
                 with open(tokens_path, "rb") as f:
                     arr.fromfile(f, entry_meta["num_tokens"])
                 tokens = list(arr)
+                if len(tokens) < self._config.min_prefix_tokens:
+                    logger.info(
+                        "[cache_persist] skipping short entry %s: %s tokens < "
+                        "min_prefix_tokens=%s",
+                        i,
+                        len(tokens),
+                        self._config.min_prefix_tokens,
+                    )
+                    continue
 
                 # Load KV cache
                 cache = load_prompt_cache(entry_path)
@@ -989,25 +1415,26 @@ class MemoryAwarePrefixCache:
                 # Estimate memory
                 memory = estimate_kv_cache_memory(cache)
 
-                # Check if it fits
-                if self._current_memory + memory > self._max_memory:
-                    logger.info(
-                        f"[cache_persist] entry {i} would exceed memory limit "
-                        f"({(self._current_memory + memory) / _BYTES_PER_MB:.0f}MB > "
-                        f"{self._max_memory / _BYTES_PER_MB:.0f}MB), stopping load"
-                    )
-                    break
+                with self._memory_lock:
+                    # Check if it fits
+                    if self._current_memory + memory > self._max_memory:
+                        logger.info(
+                            f"[cache_persist] entry {i} would exceed memory limit "
+                            f"({(self._current_memory + memory) / _BYTES_PER_MB:.0f}MB > "
+                            f"{self._max_memory / _BYTES_PER_MB:.0f}MB), stopping load"
+                        )
+                        break
 
-                tokens_key = tuple(tokens)
-                entry = _CacheEntry(
-                    tokens=tokens_key,
-                    cache=cache,
-                    memory_bytes=memory,
-                )
-                self._entries[tokens_key] = entry
-                self._current_memory += memory
-                bisect.insort(self._sorted_keys, tokens_key)
-                loaded += 1
+                    tokens_key = tuple(tokens)
+                    entry = _CacheEntry(
+                        tokens=tokens_key,
+                        cache=cache,
+                        memory_bytes=memory,
+                    )
+                    self._entries[tokens_key] = entry
+                    self._current_memory += memory
+                    bisect.insort(self._sorted_keys, tokens_key)
+                    loaded += 1
 
                 logger.info(
                     f"[cache_persist] loaded entry {i}: "
@@ -1018,8 +1445,9 @@ class MemoryAwarePrefixCache:
             except Exception as e:
                 logger.warning(f"[cache_persist] failed to load entry {i}: {e}")
 
-        self._stats.entry_count = len(self._entries)
-        self._stats.current_memory_bytes = self._current_memory
+        with self._memory_lock:
+            self._stats.entry_count = len(self._entries)
+            self._stats.current_memory_bytes = self._current_memory
 
         dt = _time.monotonic() - t0
         logger.info(

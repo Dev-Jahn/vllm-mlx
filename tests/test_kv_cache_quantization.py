@@ -2,11 +2,12 @@
 """Tests for KV cache quantization in prefix cache."""
 
 import mlx.core as mx
-from mlx_lm.models.cache import KVCache, QuantizedKVCache
+from mlx_lm.models.cache import KVCache
 
 from vllm_mlx.memory_cache import (
     MemoryAwarePrefixCache,
     MemoryCacheConfig,
+    _QuantizedCacheWrapper,
     _dequantize_cache,
     _quantize_cache,
     _trim_to_offset,
@@ -37,7 +38,7 @@ class TestQuantizeDequantize:
         quantized = _quantize_cache(cache, bits=8, group_size=64)
         assert len(quantized) == len(cache)
         for layer in quantized:
-            assert isinstance(layer, QuantizedKVCache)
+            assert isinstance(layer, _QuantizedCacheWrapper)
 
     def test_dequantize_produces_kv_cache(self):
         cache = _make_kv_cache()
@@ -107,7 +108,7 @@ class TestMixedCacheLayers:
         cache = [kv, fake_mamba]
         quantized = _quantize_cache(cache, bits=8, group_size=64)
 
-        assert isinstance(quantized[0], QuantizedKVCache)
+        assert isinstance(quantized[0], _QuantizedCacheWrapper)
         assert isinstance(quantized[1], dict)  # Preserved as-is
 
         restored = _dequantize_cache(quantized)
@@ -165,7 +166,11 @@ class TestPrefixCacheIntegration:
 
     def test_store_fetch_without_quantization(self):
         model = self._make_cache_and_model()
-        config = MemoryCacheConfig(kv_quantize=False, max_memory_mb=500)
+        config = MemoryCacheConfig(
+            kv_quantize=False,
+            max_memory_mb=500,
+            min_prefix_tokens=1,
+        )
         pc = MemoryAwarePrefixCache(model, config)
 
         cache = _make_kv_cache(n_layers=2, seq_len=50)
@@ -186,6 +191,7 @@ class TestPrefixCacheIntegration:
             kv_bits=8,
             kv_min_quantize_tokens=0,
             max_memory_mb=500,
+            min_prefix_tokens=1,
         )
         pc = MemoryAwarePrefixCache(model, config)
 
@@ -196,7 +202,7 @@ class TestPrefixCacheIntegration:
         # Internally stored as quantized
         stored_entry = list(pc._entries.values())[0]
         for layer in stored_entry.cache:
-            assert isinstance(layer, QuantizedKVCache)
+            assert isinstance(layer, _QuantizedCacheWrapper)
 
         # Fetched as dequantized KVCache
         fetched, remaining = pc.fetch(tokens)
@@ -281,6 +287,7 @@ class TestMinQuantizeTokensThreshold:
             kv_bits=8,
             kv_min_quantize_tokens=256,
             max_memory_mb=500,
+            min_prefix_tokens=1,
         )
         pc = MemoryAwarePrefixCache(model, config)
 
@@ -312,13 +319,17 @@ class TestMinQuantizeTokensThreshold:
         stored_entry = list(pc._entries.values())[0]
         for layer in stored_entry.cache:
             assert isinstance(
-                layer, QuantizedKVCache
+                layer, _QuantizedCacheWrapper
             ), "Long sequences should be quantized"
 
     def test_trim_applied_without_quantization(self):
         """Oversized arrays should be trimmed even without quantization."""
         model = self._make_model()
-        config = MemoryCacheConfig(kv_quantize=False, max_memory_mb=500)
+        config = MemoryCacheConfig(
+            kv_quantize=False,
+            max_memory_mb=500,
+            min_prefix_tokens=1,
+        )
         pc = MemoryAwarePrefixCache(model, config)
 
         # Create oversized cache: arrays have 4096 but offset is 100

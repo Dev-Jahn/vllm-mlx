@@ -2,7 +2,7 @@
 
 ## Requirements
 
-- macOS on Apple Silicon (M1/M2/M3/M4)
+- macOS on Apple Silicon (M1/M2/M3/M4/M5)
 - Python 3.10+
 
 ## Install with uv (Recommended)
@@ -81,9 +81,24 @@ Check your internet connection and HuggingFace access. Some models require authe
 huggingface-cli login
 ```
 
+You can inspect and stage models before serving:
+```bash
+vllm-mlx model inspect mlx-community/Llama-3.2-3B-Instruct-4bit
+vllm-mlx model acquire mlx-community/Llama-3.2-3B-Instruct-4bit \
+  --target-dir ./models/llama-3b-4bit
+```
+
 ### Out of memory
 
 Use a smaller quantized model:
 ```bash
 vllm-mlx serve mlx-community/Llama-3.2-1B-Instruct-4bit
+```
+
+### Server interruptions during long runs (macOS sleep)
+
+Your macOS machine may go to sleep during long-running server sessions. Try using `caffeinate` to prevent sleep:
+
+```bash
+caffeinate -dimsu
 ```

@@ -7,8 +7,12 @@ integrating with vLLM's model execution system.
 """
 
 import logging
+from collections.abc import Iterator
 from dataclasses import dataclass
-from typing import Iterator
+from typing import TYPE_CHECKING, Union
+
+if TYPE_CHECKING:
+    import mlx.core as mx
 
 logger = logging.getLogger(__name__)
 
@@ -30,6 +34,7 @@ class StreamingOutput:
     token: int
     finished: bool = False
     finish_reason: str | None = None
+    prompt_tokens: int = 0
 
 
 class MLXLanguageModel:
@@ -51,6 +56,7 @@ class MLXLanguageModel:
         tokenizer_name: str | None = None,
         trust_remote_code: bool = False,
         mtp: bool = False,
+        mtp_num_draft_tokens: int = 1,
     ):
         """
         Initialize the MLX language model.
@@ -60,11 +66,13 @@ class MLXLanguageModel:
             tokenizer_name: Optional separate tokenizer name
             trust_remote_code: Whether to trust remote code
             mtp: Enable native MTP speculative decoding (model must have MTP head)
+            mtp_num_draft_tokens: Draft tokens per speculative MTP step
         """
         self.model_name = model_name
         self.tokenizer_name = tokenizer_name or model_name
         self.trust_remote_code = trust_remote_code
         self._mtp = mtp
+        self._mtp_num_draft_tokens = mtp_num_draft_tokens
 
         self.model = None
         self.tokenizer = None
@@ -97,11 +105,10 @@ class MLXLanguageModel:
             self._loaded = True
             logger.info(f"Model loaded successfully: {self.model_name}")
 
-        except ImportError:
+        except ImportError as err:
             raise ImportError(
-                "mlx-lm is required for LLM inference. "
-                "Install with: pip install mlx-lm"
-            )
+                "mlx-lm is required for LLM inference. Install with: pip install mlx-lm"
+            ) from err
         except Exception as e:
             logger.error(f"Failed to load model: {e}")
             raise
@@ -110,6 +117,8 @@ class MLXLanguageModel:
         self,
         temperature: float = 0.7,
         top_p: float = 0.9,
+        top_k: int = 0,
+        min_p: float = 0.0,
     ):
         """Create a sampler for text generation."""
         from mlx_lm.sample_utils import make_sampler
@@ -117,7 +126,25 @@ class MLXLanguageModel:
         return make_sampler(
             temp=temperature,
             top_p=top_p,
+            top_k=top_k,
+            min_p=min_p,
         )
+
+    def _create_logits_processors(
+        self,
+        presence_penalty: float = 0.0,
+        repetition_penalty: float = 1.0,
+    ):
+        """Create logits processors for penalty-based sampling."""
+        from mlx_lm.sample_utils import make_logits_processors
+
+        processors = make_logits_processors(
+            repetition_penalty=(
+                repetition_penalty if repetition_penalty != 1.0 else None
+            ),
+            presence_penalty=presence_penalty if presence_penalty != 0.0 else None,
+        )
+        return processors if processors else None
 
     def generate(
         self,
@@ -125,8 +152,13 @@ class MLXLanguageModel:
         max_tokens: int = 256,
         temperature: float = 0.7,
         top_p: float = 0.9,
+        top_k: int = 0,
+        min_p: float = 0.0,
+        presence_penalty: float = 0.0,
         repetition_penalty: float = 1.0,
         stop: list[str] | None = None,
+        logits_processors: list | None = None,
+        **kwargs,
     ) -> GenerationOutput:
         """
         Generate text from a prompt.
@@ -136,8 +168,14 @@ class MLXLanguageModel:
             max_tokens: Maximum number of tokens to generate
             temperature: Sampling temperature (0 = greedy)
             top_p: Top-p (nucleus) sampling parameter
-            repetition_penalty: Penalty for repeating tokens
+            top_k: Top-k sampling (0 = disabled)
+            min_p: Minimum probability threshold
+            presence_penalty: Additive penalty for token presence
+            repetition_penalty: Multiplicative penalty for repeating tokens
             stop: List of stop sequences
+            logits_processors: Optional externally-supplied logits processors
+                (e.g. JSON schema constrained decoding).  Merged with built-in
+                penalty processors.
 
         Returns:
             GenerationOutput with generated text and tokens
@@ -147,8 +185,15 @@ class MLXLanguageModel:
 
         from mlx_lm import generate
 
-        # Create sampler with parameters
-        sampler = self._create_sampler(temperature, top_p)
+        # Create sampler and logits processors with full Unsloth params
+        sampler = self._create_sampler(temperature, top_p, top_k, min_p)
+        penalty_processors = self._create_logits_processors(
+            presence_penalty, repetition_penalty
+        )
+        # Merge any externally-provided logits_processors with penalty processors
+        all_processors = penalty_processors or []
+        if logits_processors:
+            all_processors = list(logits_processors) + all_processors
 
         # Generate text
         output_text = generate(
@@ -157,6 +202,7 @@ class MLXLanguageModel:
             prompt=prompt,
             max_tokens=max_tokens,
             sampler=sampler,
+            logits_processors=all_processors if all_processors else None,
             verbose=False,
         )
 
@@ -174,23 +220,33 @@ class MLXLanguageModel:
 
     def stream_generate(
         self,
-        prompt: str,
+        prompt: Union[str, "mx.array", list[int]],
         max_tokens: int = 256,
         temperature: float = 0.7,
         top_p: float = 0.9,
+        top_k: int = 0,
+        min_p: float = 0.0,
+        presence_penalty: float = 0.0,
         repetition_penalty: float = 1.0,
         stop: list[str] | None = None,
+        logits_processors: list | None = None,
+        prompt_cache=None,
+        **kwargs,
     ) -> Iterator[StreamingOutput]:
         """
         Stream text generation token by token.
 
         Args:
-            prompt: Input prompt text
+            prompt: Input prompt text, token array, or token id list
             max_tokens: Maximum number of tokens to generate
             temperature: Sampling temperature (0 = greedy)
             top_p: Top-p (nucleus) sampling parameter
-            repetition_penalty: Penalty for repeating tokens
+            top_k: Top-k sampling (0 = disabled)
+            min_p: Minimum probability threshold
+            presence_penalty: Additive penalty for token presence
+            repetition_penalty: Multiplicative penalty for repeating tokens
             stop: List of stop sequences
+            prompt_cache: Pre-populated KV cache (e.g. from SpecPrefill)
 
         Yields:
             StreamingOutput for each generated token
@@ -200,36 +256,57 @@ class MLXLanguageModel:
 
         from mlx_lm import stream_generate
 
-        # Create sampler with parameters
-        sampler = self._create_sampler(temperature, top_p)
+        # Create sampler and logits processors with full Unsloth params
+        sampler = self._create_sampler(temperature, top_p, top_k, min_p)
+        penalty_processors = self._create_logits_processors(
+            presence_penalty, repetition_penalty
+        )
+        # Merge any externally-provided logits_processors with penalty processors
+        all_processors = None
+        if penalty_processors or logits_processors:
+            all_processors = (logits_processors or []) + (penalty_processors or [])
 
-        token_count = 0
-        accumulated_text = ""
+        # Count prompt tokens once upfront
+        if isinstance(prompt, str):
+            num_prompt_tokens = len(self.tokenizer.encode(prompt))
+        else:
+            num_prompt_tokens = len(prompt)
+
+        stop_list = stop or []
+        max_stop_len = max((len(s) for s in stop_list), default=0)
+        accumulated_tail = ""
 
         mtp_kwargs = {}
         if self._mtp:
-            mtp_kwargs["mtp"] = True
+            mtp_kwargs["num_draft_tokens"] = self._mtp_num_draft_tokens
+        if prompt_cache is not None:
+            mtp_kwargs["prompt_cache"] = prompt_cache
 
-        for response in stream_generate(
-            self.model,
-            self.tokenizer,
-            prompt=prompt,
-            max_tokens=max_tokens,
-            sampler=sampler,
-            **mtp_kwargs,
+        for token_count, response in enumerate(
+            stream_generate(
+                self.model,
+                self.tokenizer,
+                prompt=prompt,
+                max_tokens=max_tokens,
+                sampler=sampler,
+                logits_processors=all_processors,
+                **mtp_kwargs,
+            ),
+            start=1,
         ):
-            token_count += 1
             # response.text is the new token text (not accumulated)
             new_text = response.text
-            accumulated_text += new_text
 
-            # Check for stop sequences
+            # Check for stop sequences against a bounded tail rather than
+            # accumulating the full response (which is O(n^2) over the loop).
             should_stop = False
-            if stop:
-                for stop_seq in stop:
-                    if stop_seq in accumulated_text:
+            if max_stop_len > 0:
+                combined = accumulated_tail + new_text
+                for stop_seq in stop_list:
+                    if stop_seq in combined:
                         should_stop = True
                         break
+                accumulated_tail = combined[-max_stop_len:]
 
             finished = should_stop or token_count >= max_tokens
             finish_reason = None
@@ -241,6 +318,7 @@ class MLXLanguageModel:
                 token=response.token if hasattr(response, "token") else 0,
                 finished=finished,
                 finish_reason=finish_reason,
+                prompt_tokens=num_prompt_tokens,
             )
 
             if finished:
@@ -253,6 +331,7 @@ class MLXLanguageModel:
         temperature: float = 0.7,
         top_p: float = 0.9,
         tools: list | None = None,
+        chat_template_kwargs: dict | None = None,
         **kwargs,
     ) -> GenerationOutput:
         """
@@ -283,6 +362,8 @@ class MLXLanguageModel:
             # Add tools if provided and supported
             if tools:
                 template_kwargs["tools"] = tools
+            if chat_template_kwargs:
+                template_kwargs.update(chat_template_kwargs)
 
             try:
                 prompt = self.tokenizer.apply_chat_template(
@@ -290,8 +371,10 @@ class MLXLanguageModel:
                     **template_kwargs,
                 )
             except TypeError:
-                # Tokenizer doesn't support tools parameter
-                del template_kwargs["tools"]
+                # Tokenizer doesn't support all requested template kwargs
+                template_kwargs.pop("tools", None)
+                for key in (chat_template_kwargs or {}).keys():
+                    template_kwargs.pop(key, None)
                 prompt = self.tokenizer.apply_chat_template(
                     messages,
                     **template_kwargs,

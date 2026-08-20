@@ -13,7 +13,37 @@ Usage:
 """
 
 import argparse
+import json
 import sys
+
+from .cli_arg_types import (
+    make_auto_or_positive_int_arg_parser,
+    make_json_object_arg_parser,
+    make_positive_int_arg_parser,
+    memory_budget_gb_arg,
+)
+from .tool_parsers import ToolParserManager
+
+_TOOL_PARSER_CHOICES = ToolParserManager.list_registered()
+_TOOL_PARSER_HELP = (
+    "Select the tool call parser for the model. Options: "
+    f"{', '.join(_TOOL_PARSER_CHOICES)}. Required for --enable-auto-tool-choice."
+)
+
+
+def _add_tool_calling_args(serve_parser: argparse.ArgumentParser) -> None:
+    serve_parser.add_argument(
+        "--enable-auto-tool-choice",
+        action="store_true",
+        help="Enable auto tool choice for supported models. Use --tool-call-parser to specify which parser to use.",
+    )
+    serve_parser.add_argument(
+        "--tool-call-parser",
+        type=str,
+        default=None,
+        choices=_TOOL_PARSER_CHOICES,
+        help=_TOOL_PARSER_HELP,
+    )
 
 
 def serve_command(args):
@@ -26,10 +56,26 @@ def serve_command(args):
 
     # Import unified server
     from . import server
-    from .scheduler import SchedulerConfig
-    from .server import RateLimiter, app, load_model
+    from .model_registry import RegistryServeDefaults
+    from .server import RateLimiter, app, load_model, load_model_registry
 
     logger = logging.getLogger(__name__)
+    model_arg = getattr(args, "model", None)
+    models_config = getattr(args, "models_config", None)
+    memory_budget_gb = getattr(args, "memory_budget_gb", None)
+
+    if models_config and model_arg:
+        print("Error: use either positional MODEL or --models-config, not both")
+        sys.exit(1)
+    if not models_config and not model_arg:
+        print("Error: MODEL is required unless --models-config is provided")
+        sys.exit(1)
+    if models_config and args.served_model_name:
+        print("Error: --served-model-name cannot be used with --models-config")
+        sys.exit(1)
+    if memory_budget_gb is not None and not models_config:
+        print("Error: --memory-budget-gb requires --models-config")
+        sys.exit(1)
 
     # Validate tool calling arguments
     if args.enable_auto_tool_choice and not args.tool_call_parser:
@@ -37,9 +83,53 @@ def serve_command(args):
         print("Example: --enable-auto-tool-choice --tool-call-parser mistral")
         sys.exit(1)
 
+    # Validate gpu-memory-utilization range
+    if not (0.0 < args.gpu_memory_utilization <= 1.0):
+        print(
+            "Error: --gpu-memory-utilization must be between 0.0 (exclusive) and 1.0 (inclusive)"
+        )
+        sys.exit(1)
+    if args.max_tokens < 1:
+        print("Error: --max-tokens must be at least 1")
+        sys.exit(1)
+    max_request_tokens = getattr(args, "max_request_tokens", args.max_tokens)
+    max_kv_size = getattr(args, "max_kv_size", None)
+    trust_remote_code = getattr(args, "trust_remote_code", False)
+    if max_request_tokens < 1:
+        print("Error: --max-request-tokens must be at least 1")
+        sys.exit(1)
+    if args.max_tokens > max_request_tokens:
+        print("Error: --max-tokens cannot exceed --max-request-tokens")
+        sys.exit(1)
+    mllm_draft_model = getattr(args, "mllm_draft_model", None)
+    mllm_draft_kind = getattr(args, "mllm_draft_kind", None)
+    mllm_draft_block_size = getattr(args, "mllm_draft_block_size", None)
+    if mllm_draft_model and models_config:
+        print("Error: --mllm-draft-model cannot be used with --models-config")
+        sys.exit(1)
+    if mllm_draft_model and not getattr(args, "mllm", False):
+        print("Error: --mllm-draft-model requires --mllm")
+        sys.exit(1)
+    if mllm_draft_block_size is not None and mllm_draft_block_size <= 0:
+        print("Error: --mllm-draft-block-size must be a positive integer")
+        sys.exit(1)
+    if mllm_draft_model and args.continuous_batching:
+        print(
+            "Error: --mllm-draft-model is supported only without --continuous-batching"
+        )
+        sys.exit(1)
+    if mllm_draft_model and (args.auto_unload_idle_seconds > 0 or args.lazy_load_model):
+        print("Error: --mllm-draft-model is not supported with lifecycle residency yet")
+        sys.exit(1)
+
     # Configure server security settings
     server._api_key = args.api_key
     server._default_timeout = args.timeout
+    server._metrics_enabled = args.enable_metrics
+    server._metrics.configure(enabled=args.enable_metrics)
+    server._max_request_tokens = max_request_tokens
+    server._embedding_max_length = args.embedding_max_length
+    server._embedding_overflow_policy = args.embedding_overflow_policy
     if args.rate_limit > 0:
         server._rate_limiter = RateLimiter(
             requests_per_minute=args.rate_limit, enabled=True
@@ -58,13 +148,26 @@ def serve_command(args):
         server._default_temperature = args.default_temperature
     if args.default_top_p is not None:
         server._default_top_p = args.default_top_p
+    server._default_chat_template_kwargs = getattr(
+        args, "default_chat_template_kwargs", None
+    )
+    if args.default_top_k is not None:
+        server._default_top_k = args.default_top_k
+    if args.default_min_p is not None:
+        server._default_min_p = args.default_min_p
+    if args.default_presence_penalty is not None:
+        server._default_presence_penalty = args.default_presence_penalty
+    if args.default_repetition_penalty is not None:
+        server._default_repetition_penalty = args.default_repetition_penalty
+    max_audio_upload_mb = getattr(args, "max_audio_upload_mb", 25)
+    max_tts_input_chars = getattr(args, "max_tts_input_chars", 4096)
+    server._max_audio_upload_bytes = max_audio_upload_mb * 1024 * 1024
+    server._max_tts_input_chars = max_tts_input_chars
 
-    # Configure thinking mode default
-    if args.enable_thinking:
-        server._default_enable_thinking = True
-    elif args.no_thinking:
-        server._default_enable_thinking = False
-    # else: None (auto - model heuristic / per-request reasoning_effort)
+    # Configure thinking token budget
+    default_thinking_token_budget = getattr(args, "default_thinking_token_budget", None)
+    if default_thinking_token_budget is not None:
+        server._default_thinking_token_budget = default_thinking_token_budget
 
     # Configure reasoning parser
     if args.reasoning_parser:
@@ -73,6 +176,7 @@ def serve_command(args):
 
             parser_cls = get_parser(args.reasoning_parser)
             server._reasoning_parser = parser_cls()
+            server._reasoning_parser_name = args.reasoning_parser
             logger.info(f"Reasoning parser enabled: {args.reasoning_parser}")
         except KeyError as e:
             print(f"Error: {e}")
@@ -88,6 +192,7 @@ def serve_command(args):
             sys.exit(1)
     else:
         server._reasoning_parser = None
+        server._reasoning_parser_name = None
 
     # Security summary at startup
     print("=" * 60)
@@ -102,6 +207,18 @@ def serve_command(args):
     else:
         print("  Rate limiting: DISABLED - Use --rate-limit to enable")
     print(f"  Request timeout: {args.timeout}s")
+    if args.enable_metrics:
+        print("  Metrics: ENABLED (/metrics, unauthenticated)")
+    else:
+        print("  Metrics: DISABLED - Use --enable-metrics to expose /metrics")
+    if trust_remote_code:
+        print("  Remote code loading: ENABLED (--trust-remote-code)")
+    else:
+        print("  Remote code loading: DISABLED (default)")
+    if args.auto_unload_idle_seconds > 0:
+        print(f"  Idle auto-unload: ENABLED ({args.auto_unload_idle_seconds:.0f}s)")
+    else:
+        print("  Idle auto-unload: DISABLED")
     if args.enable_auto_tool_choice:
         print(f"  Tool calling: ENABLED (parser: {args.tool_call_parser})")
     else:
@@ -110,16 +227,40 @@ def serve_command(args):
         print(f"  Reasoning: ENABLED (parser: {args.reasoning_parser})")
     else:
         print("  Reasoning: Use --reasoning-parser to enable")
-    if args.enable_thinking:
-        print("  Thinking: ENABLED (--enable-thinking)")
-    elif args.no_thinking:
-        print("  Thinking: DISABLED (--no-thinking)")
-    else:
-        print("  Thinking: AUTO (controllable via reasoning_effort API param)")
+    if default_thinking_token_budget is not None:
+        print(f"  Thinking budget: {default_thinking_token_budget} tokens")
+    print(
+        f"  Audio upload limit: {max_audio_upload_mb} MiB, "
+        f"TTS input limit: {max_tts_input_chars} chars"
+    )
     print("=" * 60)
 
-    print(f"Loading model: {args.model}")
+    # Pre-download model with retry/timeout
+    from .api.utils import is_mllm_model
+    from .utils.download import DownloadConfig, ensure_model_downloaded
+
+    download_config = DownloadConfig(
+        download_timeout=args.download_timeout,
+        max_retries=args.download_retries,
+        offline=getattr(args, "offline", False),
+    )
+    if model_arg:
+        ensure_model_downloaded(
+            model_arg,
+            config=download_config,
+            is_mllm=is_mllm_model(model_arg),
+        )
+        if args.lazy_load_model:
+            print(f"Registering model for lazy load: {model_arg}")
+            print("Model will load on the first request.")
+        else:
+            print(f"Loading model: {model_arg}")
+    else:
+        print(f"Loading models config: {models_config}")
     print(f"Default max tokens: {args.max_tokens}")
+    print(f"Max request tokens: {max_request_tokens}")
+    if max_kv_size is not None:
+        print(f"Max KV size: {max_kv_size} (RotatingKVCache)")
 
     # Store MCP config path for FastAPI startup
     if args.mcp_config:
@@ -127,14 +268,26 @@ def serve_command(args):
         os.environ["VLLM_MLX_MCP_CONFIG"] = args.mcp_config
 
     # Pre-load embedding model if specified
-    if args.embedding_model:
-        print(f"Pre-loading embedding model: {args.embedding_model}")
-        server.load_embedding_model(args.embedding_model, lock=True)
-        print(f"Embedding model loaded: {args.embedding_model}")
+    embedding_model = getattr(args, "embedding_model", None)
+    if embedding_model:
+        print(f"Pre-loading embedding model: {embedding_model}")
+        server.load_embedding_model(embedding_model, lock=True)
+        print(f"Embedding model loaded: {embedding_model}")
+
+    # Pre-load reranker model if specified
+    rerank_model = getattr(args, "rerank_model", None)
+    if rerank_model:
+        print(f"Pre-loading reranker model: {rerank_model}")
+        server.load_reranker_model(rerank_model, lock=True)
+        print(f"Reranker model loaded: {rerank_model}")
 
     # Build scheduler config for batched mode
     scheduler_config = None
+    specprefill_backbone_pct = getattr(args, "specprefill_backbone_pct", 0.0)
+
     if args.continuous_batching:
+        from .scheduler import SchedulerConfig
+
         # Handle prefix cache flags
         enable_prefix_cache = args.enable_prefix_cache and not args.disable_prefix_cache
 
@@ -163,13 +316,26 @@ def serve_command(args):
             kv_cache_quantization_bits=args.kv_cache_quantization_bits,
             kv_cache_quantization_group_size=args.kv_cache_quantization_group_size,
             kv_cache_min_quantize_tokens=args.kv_cache_min_quantize_tokens,
+            mllm_prefill_step_size=(
+                args.mllm_prefill_step_size if args.mllm_prefill_step_size > 0 else None
+            ),
+            # SSD cache tiering
+            ssd_cache_dir=getattr(args, "ssd_cache_dir", None),
+            ssd_cache_max_gb=getattr(args, "ssd_cache_max_gb", 10.0),
+            # KV cache size limit
+            max_kv_size=max_kv_size or 0,
         )
 
         print("Mode: Continuous batching (for multiple concurrent users)")
         if args.chunked_prefill_tokens > 0:
             print(f"Chunked prefill: {args.chunked_prefill_tokens} tokens per step")
         if args.enable_mtp:
-            print(f"MTP: enabled, draft_tokens={args.mtp_num_draft_tokens}")
+            print(f"MTP: enabled, requested_draft_tokens={args.mtp_num_draft_tokens}")
+            if args.mllm:
+                print(
+                    "MTP: MLLM path currently uses effective_draft_tokens=1 "
+                    "per verify step; inspect /v1/status for attempts and acceptance"
+                )
         print(f"Stream interval: {args.stream_interval} tokens")
         if args.use_paged_cache:
             print(
@@ -199,29 +365,198 @@ def serve_command(args):
             print(
                 f"SpecPrefill: enabled (draft={args.specprefill_draft_model}, "
                 f"threshold={args.specprefill_threshold}, "
-                f"keep={args.specprefill_keep_pct*100:.0f}%)"
+                f"keep={args.specprefill_keep_pct*100:.0f}%, "
+                f"backbone={specprefill_backbone_pct*100:.0f}%)"
+            )
+        if args.prefix_trie_cache:
+            memory = (
+                f", memory={args.prefix_trie_cache_memory_mb}MB"
+                if args.prefix_trie_cache_memory_mb is not None
+                else ""
+            )
+            print(
+                "Prefix trie cache: enabled "
+                f"(max_entries={args.prefix_trie_cache_size}{memory})"
+            )
+        if mllm_draft_model:
+            print(
+                "MLLM draft model: enabled "
+                f"(draft={mllm_draft_model}, kind={mllm_draft_kind}, "
+                f"block_size={mllm_draft_block_size})"
             )
 
-    # Load model with unified server
-    load_model(
-        args.model,
-        use_batching=args.continuous_batching,
-        scheduler_config=scheduler_config,
-        stream_interval=args.stream_interval if args.continuous_batching else 1,
-        max_tokens=args.max_tokens,
-        force_mllm=args.mllm,
-        served_model_name=args.served_model_name or args.model.rstrip('/').split('/')[-1],
-        mtp=args.enable_mtp,
-        prefill_step_size=args.prefill_step_size,
-        specprefill_enabled=args.specprefill,
-        specprefill_threshold=args.specprefill_threshold,
-        specprefill_keep_pct=args.specprefill_keep_pct,
-        specprefill_draft_model=args.specprefill_draft_model,
-    )
+    if models_config:
+        defaults = RegistryServeDefaults(
+            continuous_batching=args.continuous_batching,
+            force_mllm=getattr(args, "mllm", False),
+            enable_mtp=args.enable_mtp,
+            prefill_step_size=args.prefill_step_size,
+            specprefill_enabled=args.specprefill,
+            specprefill_threshold=args.specprefill_threshold,
+            specprefill_keep_pct=args.specprefill_keep_pct,
+            specprefill_backbone_pct=specprefill_backbone_pct,
+            specprefill_draft_model=args.specprefill_draft_model,
+            prefix_trie_cache=args.prefix_trie_cache,
+            prefix_trie_cache_size=args.prefix_trie_cache_size,
+            prefix_trie_cache_memory_mb=args.prefix_trie_cache_memory_mb,
+            stream_interval=args.stream_interval if args.continuous_batching else 1,
+            gpu_memory_utilization=args.gpu_memory_utilization,
+            scheduler_config=scheduler_config,
+            max_tokens=args.max_tokens,
+            download_config=download_config,
+        )
+        load_model_registry(
+            models_config,
+            defaults=defaults,
+            memory_budget_gb=memory_budget_gb,
+        )
+    else:
+        # Load model with unified server
+        load_model(
+            model_arg,
+            use_batching=args.continuous_batching,
+            scheduler_config=scheduler_config,
+            stream_interval=args.stream_interval if args.continuous_batching else 1,
+            max_tokens=args.max_tokens,
+            max_request_tokens=max_request_tokens,
+            force_mllm=getattr(args, "mllm", False),
+            gpu_memory_utilization=args.gpu_memory_utilization,
+            # Default served model name to the last path component of the
+            # model path (fork behavior; upstream serves the full path/repo id)
+            served_model_name=args.served_model_name
+            or model_arg.rstrip("/").split("/")[-1],
+            trust_remote_code=trust_remote_code,
+            mtp=args.enable_mtp,
+            prefill_step_size=args.prefill_step_size,
+            specprefill_enabled=args.specprefill,
+            specprefill_threshold=args.specprefill_threshold,
+            specprefill_keep_pct=args.specprefill_keep_pct,
+            specprefill_backbone_pct=specprefill_backbone_pct,
+            specprefill_draft_model=args.specprefill_draft_model,
+            prefix_trie_cache=args.prefix_trie_cache,
+            prefix_trie_cache_size=args.prefix_trie_cache_size,
+            prefix_trie_cache_memory_mb=args.prefix_trie_cache_memory_mb,
+            mllm_draft_model=mllm_draft_model,
+            mllm_draft_kind=mllm_draft_kind,
+            mllm_draft_block_size=mllm_draft_block_size,
+            warm_prompts_path=getattr(args, "warm_prompts", None),
+            auto_unload_idle_seconds=args.auto_unload_idle_seconds,
+            lazy_load_model=args.lazy_load_model,
+        )
 
     # Start server
     print(f"Starting server at http://{args.host}:{args.port}")
     uvicorn.run(app, host=args.host, port=args.port, log_level="info")
+
+
+def download_command(args):
+    """Download a model to local cache without starting a server."""
+    from .utils.download import DownloadConfig, ensure_model_downloaded
+
+    config = DownloadConfig(
+        download_timeout=args.timeout,
+        max_retries=args.retries,
+    )
+    print(f"Downloading model: {args.model}")
+    path = ensure_model_downloaded(
+        args.model,
+        config=config,
+        is_mllm=args.mllm,
+    )
+    print(f"Model ready at: {path}")
+
+
+def model_command(args):
+    """Run model lifecycle helper commands."""
+    from .model_workflow import (
+        AcquisitionOptions,
+        ConversionOptions,
+        QualificationOptions,
+        RegistrationOptions,
+        acquire_model,
+        convert_model,
+        inspect_model,
+        qualify_model,
+        register_model,
+    )
+
+    if args.model_command == "inspect":
+        payload = inspect_model(
+            args.model,
+            revision=args.revision,
+            local_files_only=args.local_files_only,
+        )
+    elif args.model_command == "acquire":
+        payload = acquire_model(
+            args.model,
+            options=AcquisitionOptions(
+                revision=args.revision,
+                target_dir=args.target_dir,
+                staging_dir=args.staging_dir,
+                is_mllm=args.mllm,
+                fast_transfer=not args.no_fast_transfer,
+                local_files_only=args.local_files_only,
+            ),
+        )
+    elif args.model_command == "convert":
+        payload = convert_model(
+            ConversionOptions(
+                source_path=args.source,
+                output_path=args.output,
+                quantize=args.quantize,
+                q_bits=args.q_bits,
+                q_group_size=args.q_group_size,
+                q_mode=args.q_mode,
+                quant_predicate=args.quant_predicate,
+                dtype=args.dtype,
+                trust_remote_code=args.trust_remote_code,
+                dry_run=args.dry_run,
+            )
+        )
+        if payload.get("status") == "failed":
+            print(json.dumps(payload, indent=2))
+            sys.exit(payload.get("returncode") or 1)
+    elif args.model_command == "register":
+        payload = register_model(
+            RegistrationOptions(
+                artifact_path=args.artifact,
+                model_id=args.model_id,
+                served_model_name=args.served_model_name,
+                preset_alias=args.preset_alias,
+                output_path=args.output,
+                mllm=args.mllm,
+                tool_call_parser=args.tool_call_parser,
+                reasoning_parser=args.reasoning_parser,
+                default_temperature=args.default_temperature,
+                default_top_p=args.default_top_p,
+                default_top_k=args.default_top_k,
+                default_min_p=args.default_min_p,
+                default_presence_penalty=args.default_presence_penalty,
+                default_repetition_penalty=args.default_repetition_penalty,
+                chat_template_kwargs=args.default_chat_template_kwargs,
+                feature_flags=args.feature_flag,
+            )
+        )
+    elif args.model_command == "qualify":
+        payload = qualify_model(
+            QualificationOptions(
+                model_id=args.model_id,
+                server_url=args.url,
+                workload_path=args.workload,
+                output_path=args.output,
+                result_path=args.result_output,
+                repetitions=args.repetitions,
+                dry_run=args.dry_run,
+                extra_args=args.extra_arg,
+            )
+        )
+        if payload.get("status") == "failed":
+            print(json.dumps(payload, indent=2))
+            sys.exit(payload.get("returncode") or 1)
+    else:
+        raise ValueError(f"Unsupported model command: {args.model_command}")
+
+    print(json.dumps(payload, indent=2))
 
 
 def bench_command(args):
@@ -262,6 +597,7 @@ def bench_command(args):
             kv_cache_quantization_group_size=args.kv_cache_quantization_group_size,
             kv_cache_min_quantize_tokens=args.kv_cache_min_quantize_tokens,
         )
+
         engine_config = EngineConfig(
             model_name=args.model,
             scheduler_config=scheduler_config,
@@ -606,7 +942,112 @@ def bench_kv_cache_command(args):
     )
 
 
-def main():
+def bench_serve_command(args):
+    """Run serving benchmark."""
+    import asyncio
+
+    from .bench_serve import run_bench_serve, run_bench_serve_workload
+
+    if args.workload:
+        sweep_only_warnings = []
+        if args.prompts != "short,medium,long":
+            sweep_only_warnings.append(f"--prompts={args.prompts}")
+        if args.concurrency != "1,4":
+            sweep_only_warnings.append(f"--concurrency={args.concurrency}")
+        if args.warmup != 1:
+            sweep_only_warnings.append(f"--warmup={args.warmup}")
+        if sweep_only_warnings:
+            import sys as _sys
+
+            print(
+                f"Warning: --workload mode ignores sweep-only args: "
+                f"{', '.join(sweep_only_warnings)}",
+                file=_sys.stderr,
+            )
+        request_timeout_s = (
+            None if args.request_timeout_s <= 0 else args.request_timeout_s
+        )
+        output_format = "json" if args.format == "auto" else args.format
+        asyncio.run(
+            run_bench_serve_workload(
+                url=args.url,
+                workload_path=args.workload,
+                model=args.model,
+                output_path=args.output,
+                output_format=output_format,
+                scrape=args.scrape_metrics == "true",
+                include_content=args.include_content,
+                request_timeout_s=request_timeout_s,
+                repetitions=args.repetitions,
+                cache_policy=args.cache_policy,
+            )
+        )
+        return
+
+    prompt_sets = args.prompts.split(",")
+    concurrencies = [int(c) for c in args.concurrency.split(",")]
+
+    # Parse thinking values
+    thinking_values = [None]
+    if args.enable_thinking:
+        thinking_values = []
+        for v in args.enable_thinking.split(","):
+            v = v.strip().lower()
+            if v == "true":
+                thinking_values.append(True)
+            elif v == "false":
+                thinking_values.append(False)
+
+    # Parse extra body (comma-separated JSON dicts)
+    extra_bodies = [""]
+    if args.extra_body:
+        # Handle both '{"a":1}','{"b":2}' and {"a":1},{"b":2}
+        import re
+
+        extra_bodies = [
+            s.strip().strip("'\"")
+            for s in re.split(r"(?<=})\s*,\s*(?={)", args.extra_body)
+        ]
+
+    # Parse override fields
+    overrides = {}
+    for kv in args.override_field or []:
+        if "=" in kv:
+            k, v = kv.split("=", 1)
+            overrides[k] = v
+
+    output_format = "table" if args.format == "auto" else args.format
+    asyncio.run(
+        run_bench_serve(
+            url=args.url,
+            model=args.model,
+            prompt_sets=prompt_sets,
+            prompt_file=args.prompt_file,
+            concurrencies=concurrencies,
+            max_tokens=args.max_tokens,
+            repetitions=args.repetitions,
+            warmup=args.warmup,
+            thinking_values=thinking_values,
+            extra_bodies=extra_bodies,
+            output_path=args.output,
+            fmt=output_format,
+            do_validate=args.validate == "true",
+            scrape=args.scrape_metrics == "true",
+            tag=args.tag,
+            override_fields=overrides,
+            system_prompt_file=args.system_prompt_file,
+            # Auto-enable skip-preflight when a system-prompt-file is set:
+            # the whole point of that flag is measuring warm-cache behavior,
+            # and the preflight count_prompt_tokens request pollutes the cache.
+            skip_preflight_token_count=(
+                args.skip_preflight_token_count or bool(args.system_prompt_file)
+            ),
+        )
+    )
+
+
+def create_parser() -> argparse.ArgumentParser:
+    """Build the top-level CLI parser."""
     parser = argparse.ArgumentParser(
         description="vllm-mlx: Apple Silicon MLX backend for vLLM",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -620,7 +1061,23 @@ Examples:
 
     # Serve command
     serve_parser = subparsers.add_parser("serve", help="Start OpenAI-compatible server")
-    serve_parser.add_argument("model", type=str, help="Model to serve")
+    serve_parser.add_argument("model", nargs="?", type=str, help="Model to serve")
+    serve_parser.add_argument(
+        "--models-config",
+        type=str,
+        default=None,
+        help="YAML file describing a registry of models for lazy multi-model serving",
+    )
+    serve_parser.add_argument(
+        "--memory-budget-gb",
+        type=memory_budget_gb_arg,
+        default=None,
+        help=(
+            "Override the registry manager model-weight residency budget in GB. "
+            "This is not a total runtime-memory limit and does not guarantee "
+            "prevention of Metal/MLX OOM."
+        ),
+    )
     serve_parser.add_argument(
         "--served-model-name",
         type=str,
@@ -628,7 +1085,10 @@ Examples:
         help="The model name used in the API. If not specified, the model argument is used.",
     )
     serve_parser.add_argument(
-        "--host", type=str, default="0.0.0.0", help="Host to bind"
+        "--host",
+        type=str,
+        default="127.0.0.1",
+        help="Host to bind (default: localhost; use 0.0.0.0 to expose externally)",
     )
     serve_parser.add_argument("--port", type=int, default=8000, help="Port to bind")
     serve_parser.add_argument(
@@ -639,6 +1099,12 @@ Examples:
     )
     serve_parser.add_argument(
         "--completion-batch-size", type=int, default=32, help="Completion batch size"
+    )
+    serve_parser.add_argument(
+        "--mllm-prefill-step-size",
+        type=int,
+        default=0,
+        help="Override MLLM prefill-step guard (0=use MLLM default: 1024)",
     )
     serve_parser.add_argument(
         "--enable-prefix-cache",
@@ -700,11 +1166,47 @@ Examples:
         default=256,
         help="Minimum tokens for quantization to apply (default: 256)",
     )
+    # SSD cache tiering options
+    serve_parser.add_argument(
+        "--ssd-cache-dir",
+        type=str,
+        default=None,
+        help="Directory for SSD KV cache tier (default: disabled)",
+    )
+    serve_parser.add_argument(
+        "--ssd-cache-max-gb",
+        type=float,
+        default=10.0,
+        help="Maximum SSD cache size in GB (default: 10.0)",
+    )
+    # Prompt warm-up options
+    serve_parser.add_argument(
+        "--warm-prompts",
+        type=str,
+        default=None,
+        help=(
+            "Path to a JSON file with prompts to pre-run at startup. Populates "
+            "the prefix cache so the first real request hits warm (cold TTFT "
+            "drops 1.3-2.3x on agent workloads). File format is a list of "
+            "message arrays, same shape as /v1/chat/completions messages. "
+            "Prompts are warmed concurrently — keep the file small (1-3 entries "
+            "for typical agent deployments) to avoid memory pressure at boot."
+        ),
+    )
     serve_parser.add_argument(
         "--stream-interval",
         type=int,
         default=1,
         help="Tokens to batch before streaming (1=smooth, higher=throughput)",
+    )
+    serve_parser.add_argument(
+        "--max-kv-size",
+        type=int,
+        default=None,
+        help="Maximum KV cache size per sequence. When set, uses RotatingKVCache "
+        "which bounds memory at the cost of losing early context. Reasoning "
+        "models (e.g. Qwen3, DeepSeek-R1) should use >= 32768 to avoid "
+        "evicting the think block mid-generation.",
     )
     serve_parser.add_argument(
         "--max-tokens",
@@ -713,9 +1215,23 @@ Examples:
         help="Default max tokens for generation (default: 32768)",
     )
     serve_parser.add_argument(
+        "--max-request-tokens",
+        type=int,
+        default=32768,
+        help="Maximum max_tokens accepted from API clients (default: 32768)",
+    )
+    serve_parser.add_argument(
         "--continuous-batching",
         action="store_true",
         help="Enable continuous batching for multiple concurrent users (slower for single user)",
+    )
+    serve_parser.add_argument(
+        "--gpu-memory-utilization",
+        type=float,
+        default=0.90,
+        help="Fraction of device memory for Metal allocation limit and emergency "
+        "cache clear threshold (0.0-1.0, default: 0.90). Increase to 0.95 for "
+        "large models (200GB+) that need more memory headroom.",
     )
     # Paged cache options (experimental)
     serve_parser.add_argument(
@@ -796,11 +1312,60 @@ Examples:
         "Lower = faster prefill but more quality loss.",
     )
     serve_parser.add_argument(
+        "--specprefill-backbone-pct",
+        type=float,
+        default=0.0,
+        help="Fraction of chunks reserved for evenly spaced sparse-prefill coverage "
+        "(default: 0.0).",
+    )
+    serve_parser.add_argument(
         "--specprefill-draft-model",
         type=str,
         default=None,
         help="Path to small draft model for SpecPrefill importance scoring. "
         "Must share the same tokenizer as the target model.",
+    )
+    serve_parser.add_argument(
+        "--prefix-trie-cache",
+        action="store_true",
+        default=False,
+        help=(
+            "Enable mlx-lm LRUPromptCache for pure-LLM SimpleEngine chat. "
+            "Default off; exact system-prefix snapshots still take precedence."
+        ),
+    )
+    serve_parser.add_argument(
+        "--prefix-trie-cache-size",
+        type=make_positive_int_arg_parser("--prefix-trie-cache-size"),
+        default=32,
+        help="Maximum prompt-cache trie entries for --prefix-trie-cache.",
+    )
+    serve_parser.add_argument(
+        "--prefix-trie-cache-memory-mb",
+        type=make_positive_int_arg_parser("--prefix-trie-cache-memory-mb"),
+        default=None,
+        help="Optional prompt-cache trie memory cap in MB.",
+    )
+    # MLLM speculative draft/assistant model
+    serve_parser.add_argument(
+        "--mllm-draft-model",
+        type=str,
+        default=None,
+        help="Path to an mlx-vlm MLLM draft/assistant model. "
+        "For Gemma 4 assistant drafters, use with --mllm-draft-kind mtp.",
+    )
+    serve_parser.add_argument(
+        "--mllm-draft-kind",
+        type=str,
+        default=None,
+        choices=["mtp"],
+        help="mlx-vlm draft kind for --mllm-draft-model.",
+    )
+    serve_parser.add_argument(
+        "--mllm-draft-block-size",
+        type=make_positive_int_arg_parser("--mllm-draft-block-size"),
+        default=None,
+        help="Draft block size passed to mlx-vlm for --mllm-draft-model.",
     )
     # MCP options
     serve_parser.add_argument(
@@ -828,38 +1393,36 @@ Examples:
         default=300.0,
         help="Default request timeout in seconds (default: 300)",
     )
-    # Tool calling options
     serve_parser.add_argument(
-        "--enable-auto-tool-choice",
+        "--enable-metrics",
         action="store_true",
-        help="Enable auto tool choice for supported models. Use --tool-call-parser to specify which parser to use.",
+        help="Expose Prometheus metrics on /metrics (disabled by default)",
     )
     serve_parser.add_argument(
-        "--tool-call-parser",
-        type=str,
-        default=None,
-        choices=[
-            "auto",
-            "mistral",
-            "qwen",
-            "qwen3_coder",
-            "llama",
-            "hermes",
-            "deepseek",
-            "kimi",
-            "granite",
-            "nemotron",
-            "xlam",
-            "functionary",
-            "glm47",
-        ],
-        help=(
-            "Select the tool call parser for the model. Options: "
-            "auto (auto-detect), mistral, qwen, qwen3_coder, llama, hermes, "
-            "deepseek, kimi, granite, nemotron, xlam, functionary, glm47. "
-            "Required for --enable-auto-tool-choice."
-        ),
+        "--auto-unload-idle-seconds",
+        type=float,
+        default=0.0,
+        help="Unload the main model after this many idle seconds (0 = disabled)",
     )
+    serve_parser.add_argument(
+        "--lazy-load-model",
+        action="store_true",
+        help="Register the main model at startup but defer loading until first request",
+    )
+    serve_parser.add_argument(
+        "--max-audio-upload-mb",
+        type=int,
+        default=25,
+        help="Maximum size of uploaded audio files in MiB (default: 25)",
+    )
+    serve_parser.add_argument(
+        "--max-tts-input-chars",
+        type=int,
+        default=4096,
+        help="Maximum number of characters accepted by /v1/audio/speech (default: 4096)",
+    )
+    # Tool calling options
+    _add_tool_calling_args(serve_parser)
     # Reasoning parser options - choices loaded dynamically from registry
     from .reasoning import list_parsers
 
@@ -875,25 +1438,16 @@ Examples:
             f"Options: {', '.join(reasoning_choices)}."
         ),
     )
-    # Thinking mode control
-    thinking_group = serve_parser.add_mutually_exclusive_group()
-    thinking_group.add_argument(
-        "--enable-thinking",
-        action="store_true",
-        default=None,
-        help="Enable thinking/reasoning mode in chat templates (default for thinking-capable models)",
-    )
-    thinking_group.add_argument(
-        "--no-thinking",
-        action="store_true",
-        default=None,
-        help="Disable thinking/reasoning mode in chat templates",
-    )
     # Multimodal option
     serve_parser.add_argument(
         "--mllm",
         action="store_true",
         help="Force load model as multimodal (vision) even if name doesn't match auto-detection patterns",
+    )
+    serve_parser.add_argument(
+        "--trust-remote-code",
+        action="store_true",
+        help="Allow HuggingFace remote code execution during model/tokenizer loading",
     )
     # Generation defaults
     serve_parser.add_argument(
@@ -908,12 +1462,109 @@ Examples:
         default=None,
         help="Override default top_p for all requests (default: use model default)",
     )
+    serve_parser.add_argument(
+        "--default-thinking-token-budget",
+        type=int,
+        default=None,
+        help=(
+            "Default thinking token budget for reasoning models. Caps reasoning "
+            "tokens by forcing the end-think sequence when the budget is exhausted. "
+            "Per-request thinking_token_budget overrides this. (default: None = unlimited)"
+        ),
+    )
+    serve_parser.add_argument(
+        "--default-chat-template-kwargs",
+        type=make_json_object_arg_parser("--default-chat-template-kwargs"),
+        default=None,
+        help=(
+            "Default chat template kwargs to apply to all requests when request "
+            "chat_template_kwargs is omitted or empty; empty request kwargs use "
+            'existing server defaults (JSON object, e.g. {"enable_thinking": true})'
+        ),
+    )
+    serve_parser.add_argument(
+        "--default-top-k",
+        type=int,
+        default=None,
+        help="Override default top_k for all requests (default: use model default)",
+    )
+    serve_parser.add_argument(
+        "--default-min-p",
+        type=float,
+        default=None,
+        help="Override default min_p for all requests (default: use model default)",
+    )
+    serve_parser.add_argument(
+        "--default-presence-penalty",
+        type=float,
+        default=None,
+        help=(
+            "Override default presence_penalty for all requests "
+            "(default: use model default)"
+        ),
+    )
+    serve_parser.add_argument(
+        "--default-repetition-penalty",
+        type=float,
+        default=None,
+        help=(
+            "Override default repetition_penalty for all requests "
+            "(default: use model default)"
+        ),
+    )
     # Embedding model option
     serve_parser.add_argument(
         "--embedding-model",
         type=str,
         default=None,
         help="Pre-load an embedding model at startup (e.g. mlx-community/embeddinggemma-300m-6bit)",
+    )
+    serve_parser.add_argument(
+        "--embedding-max-length",
+        type=make_auto_or_positive_int_arg_parser("--embedding-max-length"),
+        default=None,
+        help=(
+            "Ceiling on embedding input tokens: 'auto' (default) uses the "
+            "model-aware default (from the model's own context window), or "
+            "a positive integer to cap it lower for memory-constrained "
+            "deployments"
+        ),
+    )
+    serve_parser.add_argument(
+        "--embedding-overflow-policy",
+        type=str,
+        default="truncate",
+        choices=["truncate", "error"],
+        help=(
+            "What to do when an embedding input exceeds the effective max "
+            "length: 'truncate' (default, observable via a warning + metric) "
+            "or 'error' (reject with a structured 400 response)"
+        ),
+    )
+    # Reranker model option
+    serve_parser.add_argument(
+        "--rerank-model",
+        type=str,
+        default=None,
+        help="Pre-load a reranker model at startup (e.g. mlx-community/jina-reranker-v2-base-multilingual)",
+    )
+    # Download options
+    serve_parser.add_argument(
+        "--download-timeout",
+        type=int,
+        default=300,
+        help="Per-file download timeout in seconds (default: 300)",
+    )
+    serve_parser.add_argument(
+        "--download-retries",
+        type=int,
+        default=3,
+        help="Number of download retry attempts (default: 3)",
+    )
+    serve_parser.add_argument(
+        "--offline",
+        action="store_true",
+        help="Offline mode — only use locally cached models",
     )
     # Bench command
     bench_parser = subparsers.add_parser("bench", help="Run benchmark")
@@ -1050,6 +1701,490 @@ Examples:
         help="Quantization group size (default: 64)",
     )
 
+    # Download command
+    download_parser = subparsers.add_parser(
+        "download", help="Download a model to local cache without starting a server"
+    )
+    download_parser.add_argument("model", type=str, help="Model to download")
+    download_parser.add_argument(
+        "--timeout",
+        type=int,
+        default=300,
+        help="Per-file download timeout in seconds (default: 300)",
+    )
+    download_parser.add_argument(
+        "--retries",
+        type=int,
+        default=3,
+        help="Number of retry attempts (default: 3)",
+    )
+    download_parser.add_argument(
+        "--mllm",
+        action="store_true",
+        help="Download as multimodal model (broader file patterns)",
+    )
+
+    # Model lifecycle helpers
+    model_parser = subparsers.add_parser(
+        "model",
+        help="Inspect, acquire, or convert model artifacts",
+    )
+    model_subparsers = model_parser.add_subparsers(
+        dest="model_command", help="Model workflow command", required=True
+    )
+
+    model_inspect_parser = model_subparsers.add_parser(
+        "inspect",
+        help="Inspect a local path or Hugging Face model without loading weights",
+    )
+    model_inspect_parser.add_argument(
+        "model",
+        type=str,
+        help="Local model path or Hugging Face model id",
+    )
+    model_inspect_parser.add_argument(
+        "--revision",
+        type=str,
+        default=None,
+        help="Hugging Face revision to inspect",
+    )
+    model_inspect_parser.add_argument(
+        "--local-files-only",
+        action="store_true",
+        help="Use only local Hugging Face cache files",
+    )
+
+    model_acquire_parser = model_subparsers.add_parser(
+        "acquire",
+        help="Download a Hugging Face model and write an artifact manifest",
+    )
+    model_acquire_parser.add_argument("model", type=str, help="Hugging Face model id")
+    model_acquire_parser.add_argument(
+        "--revision",
+        type=str,
+        default=None,
+        help="Hugging Face revision to download",
+    )
+    model_acquire_parser.add_argument(
+        "--target-dir",
+        type=str,
+        default=None,
+        help="Final local directory. Defaults to Hugging Face cache.",
+    )
+    model_acquire_parser.add_argument(
+        "--staging-dir",
+        type=str,
+        default=None,
+        help="Directory for temporary staged downloads before finalizing target-dir",
+    )
+    model_acquire_parser.add_argument(
+        "--mllm",
+        action="store_true",
+        help="Acquire multimodal model files using broader allow patterns",
+    )
+    model_acquire_parser.add_argument(
+        "--no-fast-transfer",
+        action="store_true",
+        help="Do not set HF_HUB_ENABLE_HF_TRANSFER=1 during download",
+    )
+    model_acquire_parser.add_argument(
+        "--local-files-only",
+        action="store_true",
+        help="Use only local Hugging Face cache files",
+    )
+
+    model_convert_parser = model_subparsers.add_parser(
+        "convert",
+        help="Run mlx-lm conversion and write a conversion manifest",
+    )
+    model_convert_parser.add_argument(
+        "source",
+        type=str,
+        help="Hugging Face model id or local source path",
+    )
+    model_convert_parser.add_argument(
+        "--output",
+        required=True,
+        type=str,
+        help="Output directory for the converted MLX model",
+    )
+    model_convert_parser.add_argument(
+        "--quantize",
+        action="store_true",
+        help="Generate a quantized MLX model",
+    )
+    model_convert_parser.add_argument(
+        "--q-bits",
+        type=int,
+        default=None,
+        help="Quantization bit width (e.g. 3, 4, 8)",
+    )
+    model_convert_parser.add_argument(
+        "--q-group-size",
+        type=int,
+        default=None,
+        help="Quantization group size (default: mlx-lm default)",
+    )
+    model_convert_parser.add_argument(
+        "--q-mode",
+        choices=["affine", "mxfp4", "nvfp4", "mxfp8"],
+        default=None,
+    )
+    model_convert_parser.add_argument(
+        "--quant-predicate",
+        choices=["mixed_2_6", "mixed_3_4", "mixed_3_6", "mixed_4_6"],
+        default=None,
+        help="mlx-lm mixed-bit quantization recipe",
+    )
+    model_convert_parser.add_argument(
+        "--dtype",
+        choices=["float16", "bfloat16", "float32"],
+        default=None,
+        help="Non-quantized parameter dtype",
+    )
+    model_convert_parser.add_argument(
+        "--trust-remote-code",
+        action="store_true",
+        help="Allow Hugging Face remote code during mlx-lm conversion",
+    )
+    model_convert_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Print the conversion command and manifest without executing",
+    )
+
+    model_register_parser = model_subparsers.add_parser(
+        "register",
+        help="Write a portable registration manifest for a finalized artifact",
+    )
+    model_register_parser.add_argument(
+        "artifact",
+        type=str,
+        help="Finalized local model artifact directory",
+    )
+    model_register_parser.add_argument(
+        "--model-id",
+        type=str,
+        default=None,
+        help="Override model ID (default: directory name of artifact)",
+    )
+    model_register_parser.add_argument(
+        "--served-model-name",
+        type=str,
+        default=None,
+        help="Model name exposed by the API (default: model-id)",
+    )
+    model_register_parser.add_argument(
+        "--preset-alias",
+        type=str,
+        default=None,
+        help="Optional alias for preset lookup in registry",
+    )
+    model_register_parser.add_argument(
+        "--output",
+        type=str,
+        default=None,
+        help="Manifest path. Defaults to artifact/vllm_mlx_registration_manifest.json",
+    )
+    mllm_group = model_register_parser.add_mutually_exclusive_group()
+    mllm_group.add_argument(
+        "--mllm",
+        action="store_true",
+        default=None,
+        help="Mark the artifact as an MLLM serving candidate",
+    )
+    mllm_group.add_argument(
+        "--no-mllm",
+        action="store_false",
+        dest="mllm",
+        help="Explicitly mark the artifact as text-only",
+    )
+    model_register_parser.add_argument(
+        "--tool-call-parser",
+        type=str,
+        default=None,
+        help="Tool call parser name for the model (e.g. qwen3_coder, mistral)",
+    )
+    model_register_parser.add_argument(
+        "--reasoning-parser",
+        type=str,
+        default=None,
+        help="Reasoning parser name for thinking models (e.g. qwen3)",
+    )
+    model_register_parser.add_argument(
+        "--default-temperature",
+        type=float,
+        default=None,
+        help="Default temperature for all requests",
+    )
+    model_register_parser.add_argument(
+        "--default-top-p",
+        type=float,
+        default=None,
+        help="Default top_p for all requests",
+    )
+    model_register_parser.add_argument(
+        "--default-top-k",
+        type=int,
+        default=None,
+        help="Default top_k for all requests",
+    )
+    model_register_parser.add_argument(
+        "--default-min-p",
+        type=float,
+        default=None,
+        help="Default min_p for all requests",
+    )
+    model_register_parser.add_argument(
+        "--default-presence-penalty",
+        type=float,
+        default=None,
+        help="Default presence_penalty for all requests",
+    )
+    model_register_parser.add_argument(
+        "--default-repetition-penalty",
+        type=float,
+        default=None,
+        help="Default repetition_penalty for all requests",
+    )
+    model_register_parser.add_argument(
+        "--default-chat-template-kwargs",
+        type=make_json_object_arg_parser("--default-chat-template-kwargs"),
+        default=None,
+        help='Default chat template kwargs as JSON, e.g. {"enable_thinking": true}',
+    )
+    model_register_parser.add_argument(
+        "--feature-flag",
+        action="append",
+        default=[],
+        help="Feature flag to record in the registration manifest. Repeatable.",
+    )
+
+    model_qualify_parser = model_subparsers.add_parser(
+        "qualify",
+        help="Create or run a bench-serve qualification handoff",
+    )
+    model_qualify_parser.add_argument(
+        "model_id",
+        type=str,
+        help="Model ID to qualify against the running server",
+    )
+    model_qualify_parser.add_argument(
+        "--url",
+        type=str,
+        default="http://127.0.0.1:8080",
+        help="Running server URL for bench-serve",
+    )
+    model_qualify_parser.add_argument(
+        "--workload",
+        type=str,
+        default=None,
+        help="bench-serve workload contract path",
+    )
+    model_qualify_parser.add_argument(
+        "--output",
+        type=str,
+        default=None,
+        help="Qualification request manifest path",
+    )
+    model_qualify_parser.add_argument(
+        "--result-output",
+        type=str,
+        default=None,
+        help="Result output path passed to bench-serve",
+    )
+    model_qualify_parser.add_argument(
+        "--repetitions",
+        type=int,
+        default=None,
+        help="Number of repetitions per benchmark sweep configuration",
+    )
+    model_qualify_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Write or print the qualification command without running it",
+    )
+    model_qualify_parser.add_argument(
+        "--extra-arg",
+        action="append",
+        default=[],
+        help="Extra argument passed through to bench-serve. Repeatable.",
+    )
+
+    # Serving benchmark
+    bench_serve_parser = subparsers.add_parser(
+        "bench-serve", help="Benchmark a running vllm-mlx server via HTTP API"
+    )
+    bench_serve_parser.add_argument(
+        "--url",
+        type=str,
+        default="http://127.0.0.1:8080",
+        help="Base URL of the running server (default: http://127.0.0.1:8080)",
+    )
+    bench_serve_parser.add_argument(
+        "--model",
+        type=str,
+        default=None,
+        help="Model ID to benchmark (default: auto-detected from server)",
+    )
+    bench_serve_parser.add_argument(
+        "--workload",
+        type=str,
+        default=None,
+        help=(
+            "Path to a declarative workload JSON file. When set, bench-serve "
+            "runs contract-style cases with per-case quality checks and "
+            "comparison-only policy timeouts instead of the prompt sweep."
+        ),
+    )
+    bench_serve_parser.add_argument(
+        "--prompts",
+        type=str,
+        default="short,medium,long",
+        help="Comma-separated prompt set names or paths (default: short,medium,long)",
+    )
+    bench_serve_parser.add_argument(
+        "--prompt-file",
+        type=str,
+        default=None,
+        help="Path to an additional prompt file (JSON list of message dicts)",
+    )
+    bench_serve_parser.add_argument(
+        "--system-prompt-file",
+        type=str,
+        default=None,
+        help=(
+            "Path to a text file whose contents are prepended as a system "
+            "message to every prompt. Use this together with --warm-prompts "
+            "to benchmark the warm-cache path (the warmup populates the "
+            "prefix cache with this same system, so every request in the "
+            "bench hits the cache)."
+        ),
+    )
+    bench_serve_parser.add_argument(
+        "--skip-preflight-token-count",
+        action="store_true",
+        help=(
+            "Skip the pre-flight max_tokens=1 request that counts prompt "
+            "tokens per prompt set. That request populates the prefix cache "
+            "with the full prompt, which defeats cold-vs-warm comparisons. "
+            "Auto-enabled when --system-prompt-file is set; pass this flag "
+            "explicitly to force-enable regardless."
+        ),
+    )
+    bench_serve_parser.add_argument(
+        "--concurrency",
+        type=str,
+        default="1,4",
+        help="Comma-separated concurrency levels to sweep (default: 1,4)",
+    )
+    bench_serve_parser.add_argument(
+        "--max-tokens",
+        type=int,
+        default=256,
+        help="Maximum tokens to generate per request (default: 256)",
+    )
+    bench_serve_parser.add_argument(
+        "--repetitions",
+        type=int,
+        default=3,
+        help="Number of repetitions per sweep configuration or workload case (default: 3)",
+    )
+    bench_serve_parser.add_argument(
+        "--warmup",
+        type=int,
+        default=1,
+        help="Warmup rounds before the first measured repetition (default: 1)",
+    )
+    bench_serve_parser.add_argument(
+        "--enable-thinking",
+        type=str,
+        default=None,
+        help='Enable thinking mode: "true", "false", or "true,false" to sweep both',
+    )
+    bench_serve_parser.add_argument(
+        "--extra-body",
+        type=str,
+        default=None,
+        help="Comma-separated JSON dicts to pass as extra body parameters",
+    )
+    bench_serve_parser.add_argument(
+        "--output",
+        type=str,
+        default=None,
+        help="File path to write results to (default: stdout)",
+    )
+    bench_serve_parser.add_argument(
+        "--format",
+        type=str,
+        default="auto",
+        choices=["auto", "table", "json", "csv", "sql", "sqlite"],
+        help=(
+            "Output format (auto = table for prompt sweeps, json for workloads; "
+            "sqlite requires --output)"
+        ),
+    )
+    bench_serve_parser.add_argument(
+        "--validate",
+        type=str,
+        default="true",
+        choices=["true", "false"],
+        help="Validate responses (default: true)",
+    )
+    bench_serve_parser.add_argument(
+        "--scrape-metrics",
+        type=str,
+        default="true",
+        choices=["true", "false"],
+        help="Scrape /metrics before and after each run (default: true)",
+    )
+    bench_serve_parser.add_argument(
+        "--include-content",
+        action="store_true",
+        help="Include full generated content in workload JSON output",
+    )
+    bench_serve_parser.add_argument(
+        "--request-timeout-s",
+        type=float,
+        default=300.0,
+        help=(
+            "HTTP transport timeout for workload mode in seconds (default: 300). "
+            "Use 0 to disable; product policy timeouts belong in the workload."
+        ),
+    )
+    bench_serve_parser.add_argument(
+        "--cache-policy",
+        type=str,
+        default=None,
+        choices=["preserve", "before-run", "before-case"],
+        help=(
+            "Workload cache handling (default: workload defaults or preserve). "
+            "Use before-case for cold, uncontaminated per-case qualification. "
+            "Workload JSON may also spell these with underscores."
+        ),
+    )
+    bench_serve_parser.add_argument(
+        "--tag",
+        type=str,
+        default=None,
+        help="Optional tag string stored in every result row",
+    )
+    bench_serve_parser.add_argument(
+        "--override-field",
+        nargs="*",
+        default=[],
+        help="Override result fields as key=value pairs (e.g. chip=M4Pro)",
+    )
+
+    return parser
+
+
+# Alias for test compatibility
+build_parser = create_parser
+
+
+def main():
+    parser = create_parser()
     args = parser.parse_args()
 
     if args.command == "serve":
@@ -1060,6 +2195,12 @@ Examples:
         bench_detok_command(args)
     elif args.command == "bench-kv-cache":
         bench_kv_cache_command(args)
+    elif args.command == "download":
+        download_command(args)
+    elif args.command == "model":
+        model_command(args)
+    elif args.command == "bench-serve":
+        bench_serve_command(args)
     else:
         parser.print_help()
         sys.exit(1)

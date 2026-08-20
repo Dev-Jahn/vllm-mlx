@@ -51,7 +51,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        python-version: ["3.10", "3.11", "3.12"]
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
     steps:
       - uses: actions/checkout@v4
 
@@ -63,7 +63,7 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install pytest pytest-asyncio pytest-cov pydantic fastapi jsonschema httpx psutil transformers requests
+          pip install pytest anyio pytest-cov pydantic fastapi jsonschema httpx psutil transformers requests
 
       - name: Run unit tests (no MLX required)
         run: |
@@ -82,7 +82,25 @@ jobs:
             tests/test_request.py \
             tests/test_anthropic_models.py \
             tests/test_anthropic_adapter.py \
+            tests/test_dependency_floors.py \
+            tests/test_ssd_cache_shutdown.py \
+            tests/test_simple_engine_thread_pinning.py \
             tests/test_harmony_parsers.py \
+            tests/test_endpoint_model_policies.py \
+            tests/test_truncation.py \
+            tests/test_cli_arg_types.py \
+            tests/test_gemma4_openai_format.py \
+            tests/test_gemma4_streaming_edge.py \
+            tests/test_gemma4_tool_parser.py \
+            tests/test_minimax_tool_calling.py \
+            tests/test_qwen3_xml_parser.py \
+            tests/test_qwen3_xml_registration.py \
+            tests/test_qwen3_xml_streaming_chunks.py \
+            tests/test_qwen35_mtp_hidden_state_mode.py \
+            tests/test_streaming_fence_stripper.py \
+            tests/test_streaming_think_router.py \
+            tests/test_streaming_tool_filter.py \
+            tests/test_tool_call_promotion.py \
             -v --tb=short \
             -k "not Integration and not InjectJson and not TestMLXMultimodalLMCache" \
             --cov=vllm_mlx \
@@ -98,19 +116,21 @@ jobs:
 
   test-apple-silicon:
     runs-on: macos-14
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.13"]
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up Python
+      - name: Set up Python ${{ matrix.python-version }}
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: ${{ matrix.python-version }}
 
       - name: Install project and dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -e ".[vision]"
-          pip install pytest pytest-asyncio
+          pip install -e ".[dev,vision,harmony]"
 
       - name: Verify Apple Silicon
         run: |
@@ -125,12 +145,47 @@ jobs:
             tests/test_mllm.py \
             tests/test_server.py \
             tests/test_paged_cache.py \
+            tests/test_prefix_cache_untrimmable.py \
+            tests/test_qwen35_mtp_patch.py \
             tests/test_mllm_continuous_batching.py \
             tests/test_mllm_cache.py \
             tests/test_optimizations.py \
             tests/test_simple_engine.py \
+            tests/test_simple_engine_prefix_trie_cache.py \
+            tests/test_text_model_dispatch.py \
+            tests/test_cli.py \
+            tests/test_model_registry.py \
+            tests/test_chat_template_kwargs.py \
             tests/test_batching.py \
             tests/test_continuous_batching.py \
+            tests/test_memory_cache_mlx.py \
+            tests/test_mllm_ssd_spill.py \
+            tests/test_ssd_cache.py \
+            tests/test_ssd_shutdown_wiring.py \
+            tests/test_lifecycle_cli.py \
+            tests/test_lifecycle_server.py \
+            tests/test_normalize_messages.py \
+            tests/test_responses_api.py \
+            tests/test_thinking_aware_processor.py \
+            tests/test_tool_choice_forced.py \
+            tests/test_tool_choice_none.py \
+            tests/test_harmony_render.py \
+            tests/test_embeddings.py \
+            tests/test_rerank.py \
+            -v --tb=short \
+            -m "not slow" \
+            -k "not Integration"
+
+      - name: Run EngineCore stream-affinity regression tests
+        run: |
+          # Fresh process so globals like mlx_lm.generate.generation_stream
+          # are not rebound by earlier tests (see issue #407).
+          pytest \
+            tests/test_batching_deterministic.py \
+            tests/test_batched_engine_owner_thread.py \
+            tests/test_engine_core_idle_polling.py \
+            tests/test_engine_core_stream_safety.py \
+            tests/test_engine_core_thread_streams.py \
             -v --tb=short \
             -m "not slow" \
             -k "not Integration"

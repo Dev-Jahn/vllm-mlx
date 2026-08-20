@@ -3,9 +3,14 @@
 Utility functions for text processing and model detection.
 """
 
+import json
+import logging
 import re
+from pathlib import Path
 
 from .models import Message
+
+logger = logging.getLogger(__name__)
 
 # =============================================================================
 # Special Token Patterns
@@ -17,7 +22,9 @@ SPECIAL_TOKENS_PATTERN = re.compile(
     r"<\|im_end\|>|<\|im_start\|>|<\|endoftext\|>|"
     r"<\|end\|>|<\|eot_id\|>|<\|start_header_id\|>|<\|end_header_id\|>|"
     r"<\|channel\|>|<\|message\|>|<\|start\|>|<\|return\|>|<\|call\|>|<\|constrain\|>|"
-    r"</s>|<s>|<pad>|\[PAD\]|\[SEP\]|\[CLS\]"
+    r"</s>|<s>|<pad>|\[PAD\]|\[SEP\]|\[CLS\]|"
+    r"\[e~\[|\]~b\][a-z]*|\]~!b\[|"
+    r"</?tool_call_reasoning>"
 )
 
 
@@ -102,6 +109,225 @@ def clean_output_text(text: str) -> str:
 
 
 # =============================================================================
+# Streaming Tool Call Filter
+# =============================================================================
+
+# Safety cap for tool call buffer (bytes). If a tool call block never closes,
+# the buffer is capped to prevent unbounded memory growth. In practice, the
+# buffer is bounded by max_tokens (~100KB at 32768 tokens), but this cap
+# protects against pathological cases.
+_MAX_TOOL_BUFFER_BYTES = 1_048_576  # 1 MB
+
+# Tags that delimit tool call blocks in streaming output.
+# Content inside these tags should be suppressed during streaming because
+# it will be re-emitted as structured tool_use blocks after parsing.
+_TOOL_CALL_TAGS = [
+    ("<minimax:tool_call>", "</minimax:tool_call>"),
+    ("<tool_call>", "</tool_call>"),
+    ("<function=", "</function>"),
+    ("<|tool_call>", "<tool_call|>"),
+    ("[TOOL_CALL]", "[/TOOL_CALL]"),
+    ("[Calling tool", "]\n"),  # Qwen3 bracket-style: [Calling tool: func({...})]\n
+]
+
+
+class StreamingToolCallFilter:
+    """Buffer streaming text to suppress tool call markup.
+
+    Tool call XML (e.g. <minimax:tool_call>...</minimax:tool_call>) arrives
+    split across multiple streaming deltas. This filter detects entry into a
+    tool call block, suppresses all output until the block closes, and emits
+    only non-tool-call text.
+
+    The full unfiltered text is still accumulated separately for tool call
+    parsing at stream end.
+    """
+
+    def __init__(self):
+        self._buffer = ""
+        self._in_block = False
+        self._close_tag = ""
+        # Longest open tag - used to determine how much buffer to hold back
+        self._max_open_len = max(len(t[0]) for t in _TOOL_CALL_TAGS)
+
+    def process(self, delta: str) -> str:
+        """Process a streaming delta. Returns text to emit (may be empty)."""
+        self._buffer += delta
+
+        if self._in_block:
+            return self._consume_block()
+        else:
+            return self._scan_for_open()
+
+    def _scan_for_open(self) -> str:
+        """Scan buffer for tool call open tags. Emit safe text."""
+        # Check for complete open tags
+        for open_tag, close_tag in _TOOL_CALL_TAGS:
+            idx = self._buffer.find(open_tag)
+            if idx >= 0:
+                # Found an open tag - emit text before it, enter block mode
+                emit = self._buffer[:idx]
+                self._buffer = self._buffer[idx + len(open_tag) :]
+                self._in_block = True
+                self._close_tag = close_tag
+                # Process remainder in case close tag is already in buffer
+                after = self._consume_block()
+                return emit + after
+
+        # No complete open tag found. Check if buffer ends with a partial
+        # match of any open tag - hold that back to avoid emitting a fragment.
+        hold_back = 0
+        for open_tag, _ in _TOOL_CALL_TAGS:
+            for prefix_len in range(min(len(open_tag), len(self._buffer)), 0, -1):
+                if self._buffer.endswith(open_tag[:prefix_len]):
+                    hold_back = max(hold_back, prefix_len)
+                    break
+
+        if hold_back > 0:
+            emit = self._buffer[:-hold_back]
+            self._buffer = self._buffer[-hold_back:]
+            return emit
+
+        # No partial match - safe to emit everything
+        emit = self._buffer
+        self._buffer = ""
+        return emit
+
+    def _consume_block(self) -> str:
+        """Consume content inside a tool call block. Returns empty string
+        unless the block closes and there's text after it."""
+        idx = self._buffer.find(self._close_tag)
+        if idx >= 0:
+            # Block closed - discard content up to and including close tag
+            self._buffer = self._buffer[idx + len(self._close_tag) :]
+            self._in_block = False
+            self._close_tag = ""
+            # Process remainder - might have more text or another tool call
+            if self._buffer:
+                return self._scan_for_open()
+            return ""
+        # Still inside block - suppress everything but cap buffer size
+        if len(self._buffer) > _MAX_TOOL_BUFFER_BYTES:
+            logger.warning(
+                f"Tool call buffer exceeded {_MAX_TOOL_BUFFER_BYTES} bytes, "
+                f"discarding and exiting block"
+            )
+            self._buffer = ""
+            self._in_block = False
+            self._close_tag = ""
+        return ""
+
+    def flush(self) -> str:
+        """Flush remaining buffer at end of stream."""
+        if self._in_block:
+            # Unterminated tool call block - discard
+            self._buffer = ""
+            self._in_block = False
+            return ""
+        emit = self._buffer
+        self._buffer = ""
+        return emit
+
+
+# =============================================================================
+# Streaming Think Block Router
+# =============================================================================
+
+
+class StreamingThinkRouter:
+    """Route <think>...</think> content to separate Anthropic thinking blocks.
+
+    Instead of emitting thinking content as plain text (where it's
+    indistinguishable from the response), this router yields tagged
+    pieces that the streaming handler can emit as proper Anthropic
+    content block types.
+
+    Each call to process() returns a list of (block_type, text) tuples:
+    - ("thinking", text) for content inside <think>...</think>
+    - ("text", text) for content outside think blocks
+
+    Args:
+        start_in_thinking: If True, assume the model starts in thinking
+            mode (e.g. MiniMax adds <think> to the generation prompt,
+            so the tag never appears in the output stream).
+    """
+
+    def __init__(self, start_in_thinking: bool = False):
+        self._buffer = ""
+        self._in_think = start_in_thinking
+
+    def process(self, delta: str) -> list[tuple[str, str]]:
+        """Process a delta. Returns list of (block_type, text) pieces."""
+        self._buffer += delta
+        pieces = []
+        self._extract_pieces(pieces)
+        return pieces
+
+    def _extract_pieces(self, pieces: list[tuple[str, str]]) -> None:
+        """Extract all complete pieces from the buffer."""
+        while True:
+            if self._in_think:
+                idx = self._buffer.find("</think>")
+                if idx >= 0:
+                    # Emit thinking content, exit think mode
+                    thinking = self._buffer[:idx]
+                    self._buffer = self._buffer[idx + len("</think>") :]
+                    self._in_think = False
+                    if thinking:
+                        pieces.append(("thinking", thinking))
+                    continue  # Process remainder
+                else:
+                    # Check for partial close tag at end
+                    for plen in range(min(len("</think>"), len(self._buffer)), 0, -1):
+                        if self._buffer.endswith("</think>"[:plen]):
+                            # Hold back partial match
+                            emit = self._buffer[:-plen]
+                            self._buffer = self._buffer[-plen:]
+                            if emit:
+                                pieces.append(("thinking", emit))
+                            return
+                    # No partial match - emit all as thinking
+                    if self._buffer:
+                        pieces.append(("thinking", self._buffer))
+                        self._buffer = ""
+                    return
+            else:
+                idx = self._buffer.find("<think>")
+                if idx >= 0:
+                    # Emit text before tag, enter think mode
+                    before = self._buffer[:idx]
+                    self._buffer = self._buffer[idx + len("<think>") :]
+                    self._in_think = True
+                    if before:
+                        pieces.append(("text", before))
+                    continue  # Process remainder
+                else:
+                    # Check for partial open tag at end
+                    for plen in range(min(len("<think>"), len(self._buffer)), 0, -1):
+                        if self._buffer.endswith("<think>"[:plen]):
+                            emit = self._buffer[:-plen]
+                            self._buffer = self._buffer[-plen:]
+                            if emit:
+                                pieces.append(("text", emit))
+                            return
+                    # No partial match - emit all as text
+                    if self._buffer:
+                        pieces.append(("text", self._buffer))
+                        self._buffer = ""
+                    return
+
+    def flush(self) -> list[tuple[str, str]]:
+        """Flush remaining buffer at end of stream."""
+        pieces = []
+        if self._buffer:
+            block_type = "thinking" if self._in_think else "text"
+            pieces.append((block_type, self._buffer))
+            self._buffer = ""
+        self._in_think = False
+        return pieces
+
+
+# =============================================================================
 # Model Detection
 # =============================================================================
 
@@ -118,10 +344,10 @@ MLLM_PATTERNS = [
     "PaliGemma",  # PaliGemma
     "gemma-3",
     "gemma3",  # Gemma 3 (multimodal)
+    "gemma-4",
+    "gemma4",  # Gemma 4 (multimodal: vision + audio)
     "medgemma",
     "MedGemma",  # MedGemma (medical multimodal with SigLIP vision encoder)
-    "Qwen3.5",
-    "qwen3_5",  # Qwen3.5 (omni multimodal with built-in vision tower)
     "pixtral",
     "Pixtral",  # Pixtral
     "molmo",
@@ -134,18 +360,104 @@ MLLM_PATTERNS = [
     "InternVL",  # InternVL
     "deepseek-vl",
     "DeepSeek-VL",  # DeepSeek-VL
+    "Qwen3.5-",
+    "qwen3_5",  # Qwen3.5 MoE (natively multimodal, hybrid ArraysCache+KVCache)
 ]
 
 
-def is_mllm_model(model_name: str) -> bool:
+# Config.json keys that, when present, indicate a multimodal model.
+_VLM_CONFIG_KEYS = (
+    "vision_config",
+    "audio_config",
+    "vision_tower",
+    "mm_vision_tower",
+    "image_token_id",
+    "image_token_index",
+    "audio_token_id",
+    "audio_token_index",
+)
+
+# Substrings (case-insensitive) inside `architectures` entries that identify VLMs.
+# Covers both ForConditionalGeneration VLMs (Qwen2VL, LLaVA, PaliGemma, Mllama, etc.)
+# and the few VLMs that use ForCausalLM (Phi3V, Molmo, CogVLM, InternVL).
+_VLM_ARCHITECTURE_KEYWORDS = (
+    "VLForCondition",
+    "VLForCausal",
+    "VisionForCondition",
+    "VisionForCausal",
+    "MultiModalityCausalLM",
+    "Llava",
+    "Idefics",
+    "PaliGemma",
+    "Pixtral",
+    "Molmo",
+    "Phi3V",
+    "Phi4V",
+    "CogVLM",
+    "InternVL",
+    "DeepseekVL",
+    "Mllama",
+    "Gemma3ForConditional",
+    "Gemma4ForConditional",
+)
+
+# Defensive cap on config.json size to bound parsing cost.
+_MAX_CONFIG_JSON_BYTES = 1 * 1024 * 1024
+
+
+def _try_read_config_json(name_or_path: str) -> dict | None:
+    """Read config.json from a local model directory.
+
+    Returns None when the input is not a local directory, the directory has
+    no config.json, the file is too large, or it cannot be parsed.
     """
-    Check if model name indicates a multimodal language model.
+    try:
+        candidate = Path(name_or_path)
+    except (TypeError, ValueError):
+        return None
 
-    Args:
-        model_name: HuggingFace model name or local path
+    if not candidate.is_dir():
+        return None
 
-    Returns:
-        True if model is detected as MLLM/VLM
+    config_path = candidate / "config.json"
+    if not config_path.is_file():
+        return None
+
+    try:
+        if config_path.stat().st_size > _MAX_CONFIG_JSON_BYTES:
+            return None
+        with config_path.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError, ValueError):
+        return None
+
+    return data if isinstance(data, dict) else None
+
+
+def _config_indicates_vlm(config: dict) -> bool:
+    """Inspect a parsed config.json dict for multimodal markers."""
+    archs = config.get("architectures") or []
+    if isinstance(archs, list):
+        for arch in archs:
+            if not isinstance(arch, str):
+                continue
+            arch_lower = arch.lower()
+            for keyword in _VLM_ARCHITECTURE_KEYWORDS:
+                if keyword.lower() in arch_lower:
+                    return True
+
+    for key in _VLM_CONFIG_KEYS:
+        if key in config:
+            return True
+
+    return False
+
+
+def _check_legacy_string_patterns(model_name: str) -> bool:
+    """Validation 1: substring match of MLLM_PATTERNS against the input string.
+
+    Kept for HF repo IDs (where no local config.json is reachable) and as
+    a fallback when config.json cannot be read.
     """
     model_lower = model_name.lower()
     for pattern in MLLM_PATTERNS:
@@ -154,8 +466,74 @@ def is_mllm_model(model_name: str) -> bool:
     return False
 
 
+def is_mllm_model(model_name: str) -> bool:
+    """Check if a model name or path indicates a multimodal language model.
+
+    Two complementary validations are run:
+
+    1. config.json inspection: when ``model_name`` resolves to a local
+       directory containing a readable config.json, inspect the model's
+       own metadata (``architectures`` field, ``vision_config``,
+       ``audio_config``, etc.). Authoritative when available because it
+       reflects what the model actually is, not how it is named on disk.
+
+    2. Legacy substring match against ``MLLM_PATTERNS``: applied when no
+       config.json is reachable (e.g., a HuggingFace repo ID before the
+       weights are downloaded). Preserves the historical behaviour.
+
+    Args:
+        model_name: HuggingFace repo ID or local filesystem path.
+
+    Returns:
+        True if the model is detected as multimodal (MLLM/VLM).
+    """
+    config = _try_read_config_json(model_name)
+    if config is not None:
+        return _config_indicates_vlm(config)
+    return _check_legacy_string_patterns(model_name)
+
+
 # Backwards compatibility alias
 is_vlm_model = is_mllm_model
+
+
+# =============================================================================
+# Media Content Detection
+# =============================================================================
+
+MEDIA_CONTENT_TYPES = frozenset(
+    {
+        "image_url",
+        "video_url",
+        "audio_url",
+        "image",
+        "video",
+        "audio",
+    }
+)
+
+
+def has_media_content(messages: list) -> bool:
+    """Check if any message contains media content (images, video, audio).
+
+    Handles both plain dicts (``msg.get("content")``) and Pydantic-style
+    objects (``msg.content``) so it works in both engine and server contexts.
+    """
+    for msg in messages:
+        content = (
+            msg.get("content")
+            if isinstance(msg, dict)
+            else getattr(msg, "content", None)
+        )
+        if isinstance(content, list):
+            for part in content:
+                if isinstance(part, dict):
+                    part_type = part.get("type")
+                else:
+                    part_type = getattr(part, "type", None)
+                if part_type in MEDIA_CONTENT_TYPES:
+                    return True
+    return False
 
 
 # =============================================================================
@@ -173,9 +551,9 @@ def _content_to_text(content) -> str:
         parts = []
         for item in content:
             if hasattr(item, "model_dump"):
-                item = item.model_dump()
+                item = item.model_dump(exclude_none=True)
             elif hasattr(item, "dict"):
-                item = item.dict()
+                item = {k: v for k, v in item.dict().items() if v is not None}
             if isinstance(item, dict) and item.get("type") == "text":
                 parts.append(item.get("text", ""))
         return "\n".join(parts)
@@ -185,13 +563,13 @@ def _content_to_text(content) -> str:
 def extract_multimodal_content(
     messages: list[Message],
     preserve_native_format: bool = False,
-) -> tuple[list[dict], list[str], list[str]]:
+) -> tuple[list[dict], list[str], list[str], list[str]]:
     """
-    Extract text content, images, and videos from OpenAI-format messages.
+    Extract text content, images, videos, and audio from OpenAI-format messages.
 
     Handles:
     - Simple text messages
-    - Multimodal messages with images/videos
+    - Multimodal messages with images/videos/audio
     - Tool call messages (assistant with tool_calls)
     - Tool response messages (role="tool")
 
@@ -203,14 +581,16 @@ def extract_multimodal_content(
             (e.g., Mistral, Llama 3+, DeepSeek V3).
 
     Returns:
-        Tuple of (processed_messages, images, videos)
+        Tuple of (processed_messages, images, videos, audios)
         - processed_messages: List of {"role": str, "content": str}
         - images: List of image URLs/paths/base64
         - videos: List of video URLs/paths/base64
+        - audios: List of audio URLs/paths/base64
     """
     processed_messages = []
     images = []
     videos = []
+    audios = []
 
     for msg in messages:
         # Handle both dict and Pydantic model messages
@@ -318,9 +698,9 @@ def extract_multimodal_content(
             for item in content:
                 # Handle both Pydantic models and dicts
                 if hasattr(item, "model_dump"):
-                    item = item.model_dump()
+                    item = item.model_dump(exclude_none=True)
                 elif hasattr(item, "dict"):
-                    item = item.dict()
+                    item = {k: v for k, v in item.dict().items() if v is not None}
 
                 item_type = item.get("type", "")
 
@@ -347,6 +727,16 @@ def extract_multimodal_content(
                     elif isinstance(vid_url, dict):
                         videos.append(vid_url.get("url", ""))
 
+                elif item_type == "audio":
+                    audios.append(item.get("audio", item.get("url", "")))
+
+                elif item_type == "audio_url":
+                    audio_url = item.get("audio_url", {})
+                    if isinstance(audio_url, str):
+                        audios.append(audio_url)
+                    elif isinstance(audio_url, dict):
+                        audios.append(audio_url.get("url", ""))
+
             # Combine text parts
             combined_text = "\n".join(text_parts) if text_parts else ""
             processed_messages.append({"role": role, "content": combined_text})
@@ -354,4 +744,4 @@ def extract_multimodal_content(
             # Unknown format, try to convert
             processed_messages.append({"role": role, "content": str(content)})
 
-    return processed_messages, images, videos
+    return processed_messages, images, videos, audios

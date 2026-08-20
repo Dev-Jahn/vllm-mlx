@@ -8,6 +8,9 @@ These are pure Pydantic models with no MLX dependency.
 
 import time
 
+import pytest
+from pydantic import ValidationError
+
 from vllm_mlx.api.models import (
     AssistantMessage,
     AudioSeparationRequest,
@@ -196,6 +199,25 @@ class TestToolCalling:
         assert td.type == "function"
         assert td.function["name"] == "get_weather"
 
+    def test_tool_definition_allows_openai_function_name_characters(self):
+        td = ToolDefinition(
+            function={
+                "name": "get-weather_2",
+                "description": "Get weather",
+            }
+        )
+
+        assert td.function["name"] == "get-weather_2"
+
+    def test_tool_definition_rejects_function_name_with_spaces(self):
+        with pytest.raises(ValidationError, match="function.name"):
+            ToolDefinition(
+                function={
+                    "name": "Answer Tool",
+                    "description": "Return hobbies",
+                }
+            )
+
 
 class TestResponseFormat:
     """Tests for structured output models."""
@@ -273,6 +295,31 @@ class TestChatCompletion:
         assert req.stream_options.include_usage is True
         assert req.tools is not None
         assert req.timeout == 30.0
+
+    def test_request_accepts_logit_bias(self):
+        req = ChatCompletionRequest(
+            model="test-model",
+            messages=[Message(role="user", content="Hello")],
+            logit_bias={"123": -100.0, "456": 2.5},
+        )
+
+        assert req.logit_bias == {"123": -100.0, "456": 2.5}
+
+    def test_request_rejects_tool_name_with_spaces(self):
+        with pytest.raises(ValidationError, match="function.name"):
+            ChatCompletionRequest(
+                model="test-model",
+                messages=[Message(role="user", content="Use the Answer Tool.")],
+                tools=[
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "Answer Tool",
+                            "description": "Return hobbies",
+                        },
+                    }
+                ],
+            )
 
     def test_mllm_request_params(self):
         req = ChatCompletionRequest(
@@ -631,7 +678,7 @@ class TestModelSerialization:
         msg = AssistantMessage(content="Answer", reasoning="Thought")
         data = msg.model_dump()
         assert data["reasoning_content"] == "Thought"
-        assert data["reasoning"] == "Thought"
+        assert "reasoning" not in data
 
     def test_chat_completion_response_json(self):
         resp = ChatCompletionResponse(
@@ -650,6 +697,72 @@ class TestModelSerialization:
         delta = ChatCompletionChunkDelta(reasoning="thinking")
         data = delta.model_dump()
         assert data["reasoning_content"] == "thinking"
+        assert "reasoning" not in data
+
+    def test_chat_completion_response_serializes_reasoning_content_only(self):
+        resp = ChatCompletionResponse(
+            model="test-model",
+            choices=[
+                ChatCompletionChoice(
+                    message=AssistantMessage(content="Answer", reasoning="Thought")
+                )
+            ],
+        )
+        data = resp.model_dump()
+        message = data["choices"][0]["message"]
+        assert message["reasoning_content"] == "Thought"
+        assert "reasoning" not in message
+
+    def test_chat_completion_chunk_serializes_reasoning_content_only(self):
+        chunk = ChatCompletionChunk(
+            model="test-model",
+            choices=[
+                ChatCompletionChunkChoice(
+                    delta=ChatCompletionChunkDelta(reasoning="thinking"),
+                )
+            ],
+        )
+        data = chunk.model_dump()
+        delta = data["choices"][0]["delta"]
+        assert delta["reasoning_content"] == "thinking"
+        assert "reasoning" not in delta
+
+    def test_assistant_message_excludes_null_tool_calls(self):
+        msg = AssistantMessage(content="Hello!")
+        data = msg.model_dump()
+        assert "tool_calls" not in data
+        assert "reasoning_content" not in data
+
+    def test_assistant_message_excludes_null_reasoning(self):
+        msg = AssistantMessage(content="Hello!")
+        data = msg.model_dump()
+        assert "reasoning_content" not in data
+
+    def test_chunk_delta_excludes_null_fields(self):
+        delta = ChatCompletionChunkDelta(role="assistant")
+        data = delta.model_dump()
+        assert data == {"role": "assistant"}
+        assert "content" not in data
+        assert "tool_calls" not in data
+        assert "reasoning_content" not in data
+
+    def test_chunk_delta_empty_serializes_to_empty_dict(self):
+        delta = ChatCompletionChunkDelta()
+        data = delta.model_dump()
+        assert data == {}
+
+    def test_chunk_finish_reason_null_preserved(self):
+        chunk = ChatCompletionChunk(
+            model="test",
+            choices=[
+                ChatCompletionChunkChoice(
+                    delta=ChatCompletionChunkDelta(role="assistant"),
+                    finish_reason=None,
+                )
+            ],
+        )
+        data = chunk.model_dump()
+        assert data["choices"][0]["finish_reason"] is None
 
     def test_response_format_json_schema_alias(self):
         schema = ResponseFormatJsonSchema(

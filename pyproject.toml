@@ -4,15 +4,26 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "vllm-mlx"
-version = "0.2.6"
-description = "vLLM-like inference for Apple Silicon - GPU-accelerated Text, Image, Video & Audio on Mac"
+version = "0.4.1"
+description = "OpenAI and Anthropic compatible LLM inference server for Apple Silicon, powered by MLX"
 readme = "README.md"
 license = {text = "Apache-2.0"}
 requires-python = ">=3.10"
 authors = [
     {name = "vllm-mlx contributors"}
 ]
-keywords = ["llm", "mlx", "apple-silicon", "vllm", "inference", "transformers"]
+keywords = [
+    "llm",
+    "mlx",
+    "apple-silicon",
+    "vllm",
+    "inference-server",
+    "openai-api",
+    "anthropic-api",
+    "continuous-batching",
+    "multimodal",
+    "local-llm",
+]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
@@ -29,8 +40,8 @@ classifiers = [
 
 dependencies = [
     "mlx>=0.29.0",
-    "mlx-lm>=0.30.5",  # GLM-4 models require 0.30.5+ (new attention layers)
-    "mlx-vlm @ git+https://github.com/Dev-Jahn/mlx-vlm.git",  # VLM support (fork with video processor fix)
+    "mlx-lm>=0.31.3",  # 0.31.3+ required by current mlx-vlm runtime support
+    "mlx-vlm>=0.6.5",  # 0.6.5+ fixes Qwen3.5 sanitize double-run (#674)
     "transformers>=5.0.0",  # mlx-lm 0.30.5+ requires transformers 5.0 (rc3 bug fixed in stable)
     "tokenizers>=0.19.0",
     "huggingface-hub>=0.23.0",
@@ -44,38 +55,50 @@ dependencies = [
     # Video processing for VLM
     "opencv-python>=4.8.0",
     # Vision processor (required for transformers AutoProcessor)
-    "torchvision>=0.18.0",
+    "torchvision>=0.23.0",
     # Resource monitoring
     "psutil>=5.9.0",
     # Server
     "fastapi>=0.100.0",
+    "starlette>=1.0.1",
     "uvicorn>=0.23.0",
+    "prometheus-client>=0.20.0",
     # MCP (Model Context Protocol) support
     "mcp>=1.0.0",
     # JSON Schema validation for structured output
     "jsonschema>=4.0.0",
+    # Constrained decoding (grammar-guided generation for response_format)
+    "lm-format-enforcer>=0.10.9",
     # pytz is required by gradio but not declared as a dependency
     # See: https://github.com/waybarrios/vllm-mlx/issues/23
     "pytz>=2024.1",
     # Note: mlx-audio moved to optional [audio] deps due to mlx-lm version conflict
     # See: https://github.com/waybarrios/vllm-mlx/issues/19
-    "mlx-embeddings>=0.0.5"
+    "mlx-embeddings>=0.0.5",
 ]
 
 [project.optional-dependencies]
 dev = [
     "pytest>=7.0.0",
-    "pytest-asyncio>=0.21.0",
+    "anyio>=4.0",
     "black>=23.0.0",
     "ruff>=0.1.0",
     "mypy>=1.0.0",
+    "pre-commit>=4.6.0",
 ]
 vllm = [
     "vllm>=0.4.0",
 ]
 vision = [
-    "torch>=2.4.0",
-    "torchvision>=0.18.0",
+    "torch>=2.8.0",
+    "torchvision>=0.23.0",
+]
+# Harmony prompt rendering for GPT-OSS models (see #568). With this installed
+# and ``--tool-call-parser harmony``/``gpt-oss`` set, the engine routes prompt
+# building through OpenAI's canonical renderer instead of the Jinja chat
+# template (bypasses the bracket-text fallback that loses ``tool_calls``).
+harmony = [
+    "openai-harmony>=0.0.8",
 ]
 # Audio dependencies for TTS/STT (mlx-audio)
 audio = [
@@ -99,9 +122,11 @@ audio = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/vllm-mlx/vllm-mlx"
-Documentation = "https://github.com/vllm-mlx/vllm-mlx#readme"
-Repository = "https://github.com/vllm-mlx/vllm-mlx"
+Homepage = "https://vllm-mlx.is-a.dev/"
+Documentation = "https://vllm-mlx.is-a.dev/"
+Repository = "https://github.com/waybarrios/vllm-mlx"
+Issues = "https://github.com/waybarrios/vllm-mlx/issues"
+"Release Notes" = "https://github.com/waybarrios/vllm-mlx/releases"
 
 [project.entry-points."vllm.platform_plugins"]
 mlx = "vllm_mlx.plugin:mlx_platform_plugin"
@@ -109,11 +134,15 @@ mlx = "vllm_mlx.plugin:mlx_platform_plugin"
 [project.scripts]
 vllm-mlx = "vllm_mlx.cli:main"
 vllm-mlx-chat = "vllm_mlx.gradio_app:main"
+vllm-mlx-text-chat = "vllm_mlx.gradio_text_app:main"
 vllm-mlx-bench = "vllm_mlx.benchmark:main"
 
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["vllm_mlx*"]
+
+[tool.setuptools.package-data]
+"vllm_mlx.bench_serve_prompts" = ["*.json"]
 
 [tool.black]
 line-length = 88
@@ -123,8 +152,8 @@ target-version = ["py310", "py311", "py312", "py313"]
 line-length = 88
 
 [tool.ruff.lint]
-select = ["E", "F", "W", "I", "N", "UP", "B", "SIM"]
-ignore = ["E501", "B905"]
+select = ["E", "F", "W"]
+ignore = ["B905", "E402", "E501", "E731", "F811", "F841"]
 
 [tool.mypy]
 python_version = "3.10"
@@ -135,7 +164,6 @@ ignore_missing_imports = true
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 python_files = ["test_*.py"]
-asyncio_mode = "auto"
 
 [tool.uv]
 prerelease = "allow"

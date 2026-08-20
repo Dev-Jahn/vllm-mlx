@@ -7,8 +7,11 @@ for the vLLM-style continuous batching implementation.
 """
 
 import asyncio
+import importlib
 import pytest
+from types import SimpleNamespace
 from unittest.mock import MagicMock
+import mlx.core as mx
 
 from vllm_mlx.request import (
     Request,
@@ -20,7 +23,10 @@ from vllm_mlx.scheduler import (
     Scheduler,
     SchedulerConfig,
     SchedulingPolicy,
+    _install_chunked_prefill,
 )
+
+mlx_generate = importlib.import_module("mlx_lm.generate")
 
 
 class TestRequest:
@@ -211,6 +217,379 @@ class TestSchedulerBasic:
         """Create a mock model."""
         return MagicMock()
 
+    def test_native_batch_generator_uses_chunked_prefill_budget(self):
+        """mlx-lm's current BatchGenerator owns chunking through its step size."""
+        scheduler = Scheduler(
+            model=object(),
+            tokenizer=SimpleNamespace(eos_token_id=0, eos_token_ids={0}),
+            config=SchedulerConfig(
+                enable_prefix_cache=False,
+                prefill_step_size=2048,
+                chunked_prefill_tokens=1024,
+            ),
+        )
+
+        batch_generator = scheduler._create_batch_generator(SamplingParams())
+
+        assert hasattr(batch_generator, "_prompt_batch")
+        assert hasattr(batch_generator, "_generation_batch")
+        assert hasattr(batch_generator, "_unprocessed_sequences")
+        assert batch_generator.prefill_step_size == 1024
+        assert not hasattr(batch_generator, "_partial")
+
+    def test_chunked_prefill_accepts_prompt_checkpoints(self, monkeypatch):
+        """Chunked prefill must match mlx-lm's 7-field prompt tuples."""
+
+        class FakeCacheEntry:
+            def empty(self):
+                return True
+
+        class FakePromptCache:
+            def __init__(self):
+                self.state = mx.array([0])
+
+            def finalize(self):
+                return None
+
+        class FakeStats:
+            prompt_tokens = 0
+            prompt_time = 0.0
+            generation_time = 0.0
+
+        class FakeBatchGenerator:
+            def __init__(self):
+                self._stats = FakeStats()
+                self._partial = None
+                self.active_batch = None
+                self.unprocessed_prompts = [
+                    (
+                        7,
+                        [1, 2, 3, 4, 5],
+                        16,
+                        [FakeCacheEntry()],
+                        None,
+                        [None],
+                        2,
+                    )
+                ]
+                self.prefill_batch_size = 1
+                self.completion_batch_size = 1
+                self.max_kv_size = None
+                self.stop_tokens = set()
+                self.prompt_progress_callback = lambda _progress: None
+                self.prompt_checkpoint_callback = None
+                self._next = lambda: []
+                self.remove = lambda _uids: None
+                self._process_prompts = lambda _prompts: None
+                self.model = lambda _inputs, cache=None: None
+
+        monkeypatch.setattr(
+            mlx_generate,
+            "_left_pad_prompts",
+            lambda prompts, max_length=None: mx.array(prompts),
+        )
+        monkeypatch.setattr(
+            mlx_generate,
+            "_make_cache",
+            lambda _model, _padding, _max_kv_size=None: [FakePromptCache()],
+        )
+
+        batch_gen = FakeBatchGenerator()
+        _install_chunked_prefill(batch_gen, budget=4)
+
+        responses = batch_gen._next()
+
+        assert responses == []
+        assert batch_gen._partial is not None
+        assert batch_gen._partial["prompt_checkpoint"] == 3
+        assert batch_gen._partial["processed"] == 2
+
+    def test_chunked_prefill_invokes_checkpoint_callback(self, monkeypatch):
+        """prompt_checkpoint_callback must fire after finalization."""
+
+        class FakeCacheEntry:
+            def empty(self):
+                return True
+
+        class FakePromptCache:
+            def __init__(self):
+                self.state = mx.array([0])
+
+            def finalize(self):
+                return None
+
+            def extract(self, idx):
+                return self
+
+        class FakeStats:
+            prompt_tokens = 0
+            prompt_time = 0.0
+            generation_time = 0.0
+            generation_tokens = 0
+
+        callback_payloads = []
+
+        from collections import namedtuple
+
+        _Response = namedtuple(
+            "Response", ["uid", "token", "logprobs", "finish_reason", "cache"]
+        )
+
+        class FakeBatchGenerator:
+            Response = _Response
+
+            def __init__(self):
+                self._stats = FakeStats()
+                self._partial = None
+                self.active_batch = None
+                self.unprocessed_prompts = [
+                    (
+                        7,
+                        [1, 2, 3],
+                        16,
+                        [FakeCacheEntry()],
+                        None,
+                        [None],
+                        2,
+                    )
+                ]
+                self.prefill_batch_size = 1
+                self.completion_batch_size = 1
+                self.max_kv_size = None
+                self.stop_tokens = set()
+                self.prompt_progress_callback = lambda _progress: None
+                self.prompt_checkpoint_callback = (
+                    lambda entries: callback_payloads.extend(entries)
+                )
+                self._next = lambda: []
+                self.remove = lambda _uids: None
+                self._process_prompts = lambda _prompts: None
+                self.model = lambda _inputs, cache=None: None
+
+            def _step(self, inputs, cache, samplers, logits_processors, tokens):
+                return mx.array([99]), mx.array([-1.0])
+
+            def _generation_step(self):
+                if self.active_batch is not None:
+                    self.active_batch = None
+                return []
+
+        monkeypatch.setattr(
+            mlx_generate,
+            "_left_pad_prompts",
+            lambda prompts, max_length=None: mx.array(prompts),
+        )
+        monkeypatch.setattr(
+            mlx_generate,
+            "_make_cache",
+            lambda _model, _padding, _max_kv_size=None: [FakePromptCache()],
+        )
+
+        batch_gen = FakeBatchGenerator()
+        batch_gen.stop_tokens = {99}
+        _install_chunked_prefill(batch_gen, budget=1)
+
+        # First _next: starts partial prefill (processes 1 token)
+        batch_gen._next()
+        assert batch_gen._partial is not None
+
+        # Second _next: finishes prefill, fires checkpoint callback,
+        # then runs generation step which completes (stop token).
+        batch_gen._next()
+
+        assert len(callback_payloads) == 1
+        uid, checkpoint, _cache_gen = callback_payloads[0]
+        assert uid == 7
+        assert checkpoint == 1
+
+    def test_chunked_prefill_replays_checkpoint_tail_before_step(self, monkeypatch):
+        """checkpoint tails >1 must be replayed after finalize before _step."""
+
+        class FakeCacheEntry:
+            def empty(self):
+                return True
+
+        class FakePromptCache:
+            def __init__(self):
+                self.state = mx.array([0])
+
+            def finalize(self):
+                return None
+
+            def extract(self, idx):
+                return self
+
+        class FakeStats:
+            prompt_tokens = 0
+            prompt_time = 0.0
+            generation_time = 0.0
+            generation_tokens = 0
+
+        callback_payloads = []
+        model_calls = []
+        step_inputs = []
+
+        from collections import namedtuple
+
+        _Response = namedtuple(
+            "Response", ["uid", "token", "logprobs", "finish_reason", "cache"]
+        )
+
+        class FakeBatchGenerator:
+            Response = _Response
+
+            def __init__(self):
+                self._stats = FakeStats()
+                self._partial = None
+                self.active_batch = None
+                self.unprocessed_prompts = [
+                    (
+                        7,
+                        [1, 2, 3, 4, 5],
+                        16,
+                        [FakeCacheEntry()],
+                        None,
+                        [None],
+                        2,
+                    )
+                ]
+                self.prefill_batch_size = 1
+                self.completion_batch_size = 1
+                self.max_kv_size = None
+                self.stop_tokens = {99}
+                self.prompt_progress_callback = lambda _progress: None
+                self.prompt_checkpoint_callback = (
+                    lambda entries: callback_payloads.extend(entries)
+                )
+                self._next = lambda: []
+                self.remove = lambda _uids: None
+                self._process_prompts = lambda _prompts: None
+
+            def model(self, inputs, cache=None):
+                model_calls.append(inputs.tolist())
+
+            def _step(self, inputs, cache, samplers, logits_processors, tokens):
+                step_inputs.append(inputs.tolist())
+                return mx.array([99]), mx.array([-1.0])
+
+        monkeypatch.setattr(
+            mlx_generate,
+            "_left_pad_prompts",
+            lambda prompts, max_length=None: mx.array(prompts),
+        )
+        monkeypatch.setattr(
+            mlx_generate,
+            "_make_cache",
+            lambda _model, _padding, _max_kv_size=None: [FakePromptCache()],
+        )
+
+        batch_gen = FakeBatchGenerator()
+        _install_chunked_prefill(batch_gen, budget=2)
+
+        # First _next: process the first chunk and leave a 3-token checkpoint tail.
+        batch_gen._next()
+        assert batch_gen._partial is not None
+        assert batch_gen._partial["prompt_checkpoint"] == 3
+
+        # Second _next: finalize, fire callback, replay the checkpoint tail, step.
+        batch_gen._next()
+
+        assert model_calls == [[[1, 2]], [[3, 4]]]
+        assert step_inputs[0] == [[3, 4, 5]]
+        assert len(callback_payloads) == 1
+        uid, checkpoint, _cache_gen = callback_payloads[0]
+        assert uid == 7
+        assert checkpoint == 3
+
+    def test_chunked_prefill_works_without_private_mlx_generate_exports(
+        self, monkeypatch
+    ):
+        """Chunked prefill should tolerate missing private mlx_lm.generate exports."""
+
+        class FakeCacheEntry:
+            def empty(self):
+                return True
+
+        class FakePromptCache:
+            def __init__(self):
+                self.state = mx.array([0])
+
+            def finalize(self):
+                return None
+
+            def extract(self, idx):
+                return self
+
+        class FakeStats:
+            prompt_tokens = 0
+            prompt_time = 0.0
+            generation_time = 0.0
+            generation_tokens = 0
+
+        from collections import namedtuple
+
+        _Response = namedtuple(
+            "Response", ["uid", "token", "logprobs", "finish_reason", "cache"]
+        )
+
+        class FakeBatchGenerator:
+            Response = _Response
+
+            def __init__(self):
+                self._stats = FakeStats()
+                self._partial = None
+                self.active_batch = None
+                self.unprocessed_prompts = [
+                    (
+                        7,
+                        [1, 2, 3],
+                        16,
+                        [FakeCacheEntry()],
+                        None,
+                        [None],
+                        2,
+                    )
+                ]
+                self.prefill_batch_size = 1
+                self.completion_batch_size = 1
+                self.max_kv_size = None
+                self.stop_tokens = {99}
+                self.prompt_progress_callback = lambda _progress: None
+                self.prompt_checkpoint_callback = None
+                self._next = lambda: []
+                self.remove = lambda _uids: None
+                self._process_prompts = lambda _prompts: None
+                self.model = lambda _inputs, cache=None: None
+
+            def _step(self, inputs, cache, samplers, logits_processors, tokens):
+                return mx.array([99]), mx.array([-1.0])
+
+            def _generation_step(self):
+                if self.active_batch is not None:
+                    self.active_batch = None
+                return []
+
+        monkeypatch.delattr(mlx_generate, "Batch", raising=False)
+        monkeypatch.delattr(mlx_generate, "_lazy_extract_cache", raising=False)
+        monkeypatch.setattr(
+            mlx_generate,
+            "_left_pad_prompts",
+            lambda prompts, max_length=None: mx.array(prompts),
+        )
+        monkeypatch.setattr(
+            mlx_generate,
+            "_make_cache",
+            lambda _model, _padding, _max_kv_size=None: [FakePromptCache()],
+        )
+
+        batch_gen = FakeBatchGenerator()
+        _install_chunked_prefill(batch_gen, budget=1)
+
+        batch_gen._next()
+        assert batch_gen._partial is not None
+        batch_gen._next()
+        assert batch_gen.active_batch is None
+
     def test_scheduler_creation(self, mock_model, mock_tokenizer):
         """Test scheduler creation."""
         scheduler = Scheduler(
@@ -312,6 +691,109 @@ class TestSchedulerBasic:
         assert stats["num_waiting"] == 0
         assert stats["num_running"] == 0
 
+    def test_get_stats_exposes_native_mtp_snapshot(self, mock_model, mock_tokenizer):
+        """Expose installed native-MTP counters through scheduler status."""
+        scheduler = Scheduler(
+            model=mock_model,
+            tokenizer=mock_tokenizer,
+        )
+        expected = {
+            "enabled": True,
+            "requested_draft_tokens": 4,
+            "effective_draft_tokens": 1,
+            "mode": "always_advance_verified",
+            "attempted": 7,
+            "accepted": 5,
+            "rejected": 1,
+            "errors": 1,
+            "acceptance_rate": 5 / 6,
+            "bypass_counts": {"prefill": 3},
+        }
+
+        class NativeMTPBatchGenerator:
+            @staticmethod
+            def get_mtp_stats():
+                return expected
+
+        scheduler.batch_generator = NativeMTPBatchGenerator()
+
+        assert scheduler.get_stats()["mtp"] == expected
+
+    def test_install_mtp_attaches_native_status_snapshot(self):
+        """Native MTP reports its enabled state and guarded-step reason."""
+        from vllm_mlx.scheduler import _install_mtp
+
+        class FakeBatchGenerator:
+            active_batch = None
+
+            @staticmethod
+            def _step(input_tokens, prompt_cache, samplers, logits_processors, tokens):
+                return input_tokens, []
+
+            @staticmethod
+            def _next():
+                return []
+
+        batch_gen = FakeBatchGenerator()
+        _install_mtp(batch_gen, model=object(), num_draft_tokens=4)
+
+        initial = batch_gen.get_mtp_stats()
+        assert initial["enabled"] is True
+        assert initial["requested_draft_tokens"] == 4
+        assert initial["effective_draft_tokens"] == 1
+        assert initial["attempted"] == 0
+
+        batch_gen._step(mx.array([[1]]), [], None, None, None)
+
+        assert batch_gen.get_mtp_stats()["bypass_counts"]["no_active_batch"] == 1
+
+    def test_mtp_stats_survive_sampler_driven_generator_replacement(
+        self, mock_model, mock_tokenizer, monkeypatch
+    ):
+        """Replacing BatchGenerator must not reset cumulative MTP counters."""
+
+        class FakeBatchGenerator:
+            active_batch = None
+
+            def __init__(self, **kwargs):
+                self.sampler = kwargs["sampler"]
+
+            @staticmethod
+            def _step(input_tokens, prompt_cache, samplers, logits_processors, tokens):
+                return input_tokens, []
+
+            @staticmethod
+            def _next():
+                return []
+
+        monkeypatch.setattr("vllm_mlx.scheduler.BatchGenerator", FakeBatchGenerator)
+        mock_model.mtp = object()
+        scheduler = Scheduler(
+            model=mock_model,
+            tokenizer=mock_tokenizer,
+            config=SchedulerConfig(enable_prefix_cache=False, enable_mtp=True),
+        )
+        first_params = SamplingParams(temperature=0.0, top_p=1.0, min_p=0.0)
+        scheduler._ensure_batch_generator(first_params)
+        first_generator = scheduler.batch_generator
+
+        first_generator._step(
+            mx.array([[1]]),
+            [],
+            None,
+            None,
+            None,
+        )
+        before = scheduler.get_stats()["mtp"]
+        assert before["bypass_counts"]["no_active_batch"] == 1
+
+        second_params = SamplingParams(temperature=0.7, top_p=0.9, min_p=0.0)
+        scheduler._ensure_batch_generator(second_params)
+
+        after = scheduler.get_stats()["mtp"]
+        assert scheduler.batch_generator is not first_generator
+        assert after["bypass_counts"] == before["bypass_counts"]
+
     def test_reset(self, mock_model, mock_tokenizer):
         """Test resetting scheduler."""
         scheduler = Scheduler(
@@ -335,6 +817,45 @@ class TestSchedulerBasic:
         assert scheduler.get_num_waiting() == 0
         assert scheduler.get_num_running() == 0
         assert not scheduler.has_requests()
+
+    def test_step_normalizes_stale_none_logits_processor_slots(
+        self, mock_model, mock_tokenizer
+    ):
+        """Scheduler should sanitize stale BatchGenerator per-slot None values."""
+
+        class FakeActiveBatch:
+            logits_processors = [None]
+
+        class FakeBatchGenerator:
+            def __init__(self):
+                self.active_batch = FakeActiveBatch()
+                self.called = False
+
+            def next(self):
+                self.called = True
+                assert self.active_batch.logits_processors == [[]]
+                return []
+
+        scheduler = Scheduler(
+            model=mock_model,
+            tokenizer=mock_tokenizer,
+        )
+        request = Request(
+            request_id="test-1",
+            prompt="Hello",
+            sampling_params=SamplingParams(max_tokens=2),
+        )
+        request.status = RequestStatus.RUNNING
+        scheduler.requests[request.request_id] = request
+        scheduler.running[request.request_id] = request
+        batch_generator = FakeBatchGenerator()
+        scheduler.batch_generator = batch_generator
+
+        output = scheduler.step()
+
+        assert batch_generator.called is True
+        assert output.finished_request_ids == set()
+        assert request.request_id in scheduler.running
 
 
 # Integration tests require actual MLX model
@@ -432,7 +953,7 @@ class TestSchedulerIntegration:
         assert len(finished) == len(prompts), f"Only {len(finished)} requests finished"
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 class TestEngineAsync:
     """Async tests for the engine."""
 
@@ -474,6 +995,84 @@ class TestEngineAsync:
             assert engine.engine.is_running()
 
         assert not engine.engine.is_running()
+
+    async def test_stream_outputs_consumer_break_after_finished_does_not_abort(self):
+        """Breaking after a finished output is normal consumption, not orphaning."""
+        from vllm_mlx.engine_core import EngineCore
+        from vllm_mlx.output_collector import RequestOutputCollector
+        from vllm_mlx.request import RequestOutput
+
+        engine = EngineCore.__new__(EngineCore)
+        engine._output_collectors = {"req-1": RequestOutputCollector()}
+        engine._stream_states = {}
+        engine._finished_events = {}
+        engine.scheduler = MagicMock()
+        engine.scheduler.abort_request = MagicMock(return_value=True)
+        engine.scheduler.remove_finished_request = MagicMock()
+
+        engine._output_collectors["req-1"].put(
+            RequestOutput(
+                request_id="req-1",
+                output_text="done",
+                finished=True,
+                finish_reason="stop",
+            )
+        )
+
+        stream = EngineCore.stream_outputs(engine, "req-1")
+        output = await stream.__anext__()
+        assert output.finished is True
+        await stream.aclose()
+
+        engine.scheduler.abort_request.assert_not_called()
+        engine.scheduler.remove_finished_request.assert_called_once_with("req-1")
+
+
+class TestChunkedPrefillConfig:
+    """Regression tests for chunked prefill configuration (#178)."""
+
+    def test_prompt_cache_save_installed_without_chunked_prefill(self):
+        """When chunked_prefill_tokens=0 but memory_aware_cache is active,
+        _install_prompt_cache_save should still patch _process_prompts."""
+        from vllm_mlx.scheduler import _install_prompt_cache_save
+
+        calls = []
+
+        class FakeBatchGen:
+            def _process_prompts(self, prompts):
+                class FakeBatch:
+                    uids = [42]
+                    num_tokens = [0]
+
+                    def extract_cache(self, idx):
+                        return f"cache-{idx}"
+
+                return FakeBatch()
+
+        bg = FakeBatchGen()
+        orig_fn = bg._process_prompts
+        _install_prompt_cache_save(bg, lambda uid, cache: calls.append((uid, cache)))
+
+        # _process_prompts was patched
+        assert bg._process_prompts is not orig_fn
+        bg._process_prompts([])
+        assert calls == [(42, "cache-0")], f"Expected callback to fire, got {calls}"
+
+    def test_chunked_prefill_zero_does_not_install_chunked_next(self):
+        """chunked_prefill_tokens=0 must not install the chunked _next patch,
+        even when use_memory_aware_cache=True."""
+        config = SchedulerConfig(chunked_prefill_tokens=0, use_memory_aware_cache=True)
+        need_chunked = config.chunked_prefill_tokens > 0
+        assert not need_chunked, (
+            "chunked_prefill_tokens=0 must not enable the chunked prefill "
+            "monkey-patch even when use_memory_aware_cache=True"
+        )
+
+    def test_chunked_prefill_positive_enables(self):
+        """Positive chunked_prefill_tokens should enable chunked prefill."""
+        config = SchedulerConfig(chunked_prefill_tokens=4096)
+        need_chunked = config.chunked_prefill_tokens > 0
+        assert need_chunked
 
 
 if __name__ == "__main__":

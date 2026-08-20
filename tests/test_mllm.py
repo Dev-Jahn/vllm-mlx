@@ -1,8 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for MLX Multimodal Language Model (MLLM) wrapper."""
 
+import base64
 import platform
 import sys
+from types import ModuleType
 from pathlib import Path
 
 import pytest
@@ -88,6 +90,20 @@ def test_video_path(tmp_path):
         return str(path)
 
 
+@pytest.fixture
+def test_audio_path(tmp_path):
+    """Create a small local WAV file for audio input tests."""
+    import wave
+
+    path = tmp_path / "test_audio.wav"
+    with wave.open(str(path), "wb") as wav_file:
+        wav_file.setnchannels(1)
+        wav_file.setsampwidth(2)
+        wav_file.setframerate(16000)
+        wav_file.writeframes(b"\x00\x00" * 1600)
+    return str(path)
+
+
 # =============================================================================
 # Unit Tests - No Model Loading Required
 # =============================================================================
@@ -114,6 +130,15 @@ class TestMLLMHelperFunctions:
         assert not is_base64_video("https://example.com/video.mp4")
         assert not is_base64_video("/path/to/video.mp4")
 
+    def test_is_base64_audio(self):
+        """Test base64 audio detection."""
+        from vllm_mlx.models.mllm import is_base64_audio
+
+        assert is_base64_audio("data:audio/wav;base64,AAAA")
+        assert is_base64_audio("data:audio/mp3;base64,AAAA")
+        assert not is_base64_audio("https://example.com/audio.wav")
+        assert not is_base64_audio("/path/to/audio.wav")
+
     def test_is_url(self):
         """Test URL detection."""
         from vllm_mlx.models.mllm import is_url
@@ -122,6 +147,130 @@ class TestMLLMHelperFunctions:
         assert is_url("http://example.com/video.mp4")
         assert not is_url("/path/to/file.jpg")
         assert not is_url("data:image/png;base64,AAAA")
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "file:///etc/passwd",
+            "http://127.0.0.1/private.jpg",
+            "http://169.254.169.254/latest/meta-data/",
+            "http://localhost/private.jpg",
+            "http://[::1]/private.jpg",
+        ],
+    )
+    def test_validate_url_safety_rejects_unsafe_targets(self, url):
+        """Test that local and private targets are rejected."""
+        from vllm_mlx.models.mllm import UnsafeRemoteURLError, _validate_url_safety
+
+        with pytest.raises(UnsafeRemoteURLError):
+            _validate_url_safety(url)
+
+    def test_validate_url_safety_allows_public_ip(self):
+        """Test that public literal IPs remain allowed."""
+        from vllm_mlx.models.mllm import _validate_url_safety
+
+        _validate_url_safety("https://8.8.8.8/image.jpg")
+
+    def test_unsafe_remote_url_error_has_safe_public_message(self):
+        """Public safety errors should not disclose resolved hosts or IPs."""
+        from vllm_mlx.models.mllm import UnsafeRemoteURLError, _validate_url_safety
+
+        with pytest.raises(UnsafeRemoteURLError) as exc_info:
+            _validate_url_safety("http://169.254.169.254/latest/meta-data/")
+
+        assert "169.254.169.254" in str(exc_info.value)
+        assert exc_info.value.public_message == "Remote media URL is not allowed"
+        assert "169.254.169.254" not in exc_info.value.public_message
+
+    def test_stream_chat_passes_stop_and_stops_on_stop_sequence(self, monkeypatch):
+        """Parser stop tokens must reach mlx-vlm streaming for MLLM text routes."""
+        from vllm_mlx.models import mllm
+        from vllm_mlx.models.mllm import MLXMultimodalLM
+
+        model = MLXMultimodalLM(model_name="local-test-model")
+        model._loaded = True
+        model.model = object()
+        model.processor = object()
+        model._cache_manager = None
+
+        monkeypatch.setattr(
+            mllm,
+            "_build_mllm_chat_messages",
+            lambda messages, all_image_urls, video_frame_counts: messages,
+        )
+        seen = {}
+
+        class Chunk:
+            def __init__(self, text):
+                self.text = text
+                self.prompt_tokens = 1
+
+        def fake_stream_generate(*args, **kwargs):
+            seen["stop"] = kwargs.get("stop")
+            yield Chunk("call")
+            yield Chunk("</tool_call>")
+            yield Chunk("leak")
+
+        fake_mlx_vlm = ModuleType("mlx_vlm")
+        fake_mlx_vlm.stream_generate = fake_stream_generate
+        fake_prompt_utils = ModuleType("mlx_vlm.prompt_utils")
+        fake_prompt_utils.get_chat_template = lambda *args, **kwargs: "prompt"
+        fake_models = ModuleType("mlx_vlm.models")
+        fake_cache = ModuleType("mlx_vlm.models.cache")
+        fake_cache.make_prompt_cache = lambda *args, **kwargs: None
+        monkeypatch.setitem(sys.modules, "mlx_vlm", fake_mlx_vlm)
+        monkeypatch.setitem(sys.modules, "mlx_vlm.prompt_utils", fake_prompt_utils)
+        monkeypatch.setitem(sys.modules, "mlx_vlm.models", fake_models)
+        monkeypatch.setitem(sys.modules, "mlx_vlm.models.cache", fake_cache)
+
+        chunks = list(
+            model.stream_chat(
+                messages=[{"role": "user", "content": "call tool"}],
+                max_tokens=16,
+                stop=["</tool_call>"],
+            )
+        )
+
+        assert seen["stop"] == ["</tool_call>"]
+        assert [chunk.text for chunk in chunks] == ["call", "</tool_call>", ""]
+
+    def test_request_with_safe_redirects_blocks_unsafe_redirect(self, monkeypatch):
+        """Test that redirect hops are validated before a second request."""
+        from vllm_mlx.models import mllm
+
+        calls = []
+
+        class FakeResponse:
+            def __init__(self, url, status_code, headers):
+                self.url = url
+                self.status_code = status_code
+                self.headers = headers
+                self.is_redirect = status_code in {301, 302, 303, 307, 308}
+                self.is_permanent_redirect = status_code in {301, 308}
+
+            def close(self):
+                return None
+
+        def fake_request(method, url, **kwargs):
+            calls.append((method, url, kwargs["allow_redirects"]))
+            return FakeResponse(
+                url,
+                302,
+                {"location": "http://127.0.0.1/internal.jpg"},
+            )
+
+        monkeypatch.setattr(mllm.requests, "request", fake_request)
+
+        with pytest.raises(mllm.UnsafeRemoteURLError):
+            mllm._request_with_safe_redirects(
+                "GET",
+                "https://8.8.8.8/image.jpg",
+                timeout=30,
+                headers={"User-Agent": "test"},
+                stream=True,
+            )
+
+        assert calls == [("GET", "https://8.8.8.8/image.jpg", False)]
 
 
 class TestVideoFrameExtraction:
@@ -184,38 +333,50 @@ class TestVideoFrameExtraction:
 class TestImageProcessing:
     """Test image processing functions."""
 
-    def test_process_image_input_local_file(self, test_image_path):
-        """Test processing local image file."""
+    def test_process_image_input_local_file_rejected(self, test_image_path):
+        """Test that local image paths are rejected."""
         from vllm_mlx.models.mllm import process_image_input
 
-        result = process_image_input(test_image_path)
-        assert result == test_image_path
+        with pytest.raises(ValueError, match="Unsupported image input"):
+            process_image_input(test_image_path)
 
-    def test_process_image_input_dict_format(self, test_image_path):
-        """Test processing image in dict format."""
+    def test_process_image_input_dict_format_base64(self):
+        """Test processing image in dict format with base64 payload."""
         from vllm_mlx.models.mllm import process_image_input
 
-        # OpenAI format
-        result = process_image_input({"url": test_image_path})
+        image_b64 = base64.b64encode(b"\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDR").decode()
+        result = process_image_input({"url": f"data:image/png;base64,{image_b64}"})
         assert Path(result).exists()
+
+    def test_download_image_blocks_unsafe_url_before_request(self, monkeypatch):
+        """Test that blocked image URLs fail before any request is made."""
+        from vllm_mlx.models import mllm
+
+        def fail_request(*args, **kwargs):
+            raise AssertionError("requests.request should not be called")
+
+        monkeypatch.setattr(mllm.requests, "request", fail_request)
+
+        with pytest.raises(mllm.UnsafeRemoteURLError):
+            mllm.download_image("http://169.254.169.254/latest/meta-data/")
 
 
 class TestVideoProcessing:
     """Test video processing functions."""
 
-    def test_process_video_input_local_file(self, test_video_path):
-        """Test processing local video file."""
+    def test_process_video_input_local_file_rejected(self, test_video_path):
+        """Test that local video paths are rejected."""
         from vllm_mlx.models.mllm import process_video_input
 
-        result = process_video_input(test_video_path)
-        assert result == test_video_path
+        with pytest.raises(ValueError, match="Unsupported video input"):
+            process_video_input(test_video_path)
 
-    def test_process_video_input_dict_format(self, test_video_path):
-        """Test processing video in dict format."""
+    def test_process_video_input_dict_format_base64(self):
+        """Test processing video in dict format with base64 payload."""
         from vllm_mlx.models.mllm import process_video_input
 
-        # OpenAI format
-        result = process_video_input({"url": test_video_path})
+        video_b64 = base64.b64encode(b"\x00" * 100).decode()
+        result = process_video_input({"url": f"data:video/mp4;base64,{video_b64}"})
         assert Path(result).exists()
 
     def test_process_video_input_empty_raises(self):
@@ -227,6 +388,70 @@ class TestVideoProcessing:
 
         with pytest.raises(ValueError):
             process_video_input({})
+
+    def test_download_video_blocks_unsafe_url_before_request(self, monkeypatch):
+        """Test that blocked video URLs fail before any request is made."""
+        from vllm_mlx.models import mllm
+
+        def fail_request(*args, **kwargs):
+            raise AssertionError("requests.request should not be called")
+
+        monkeypatch.setattr(mllm.requests, "request", fail_request)
+
+        with pytest.raises(mllm.UnsafeRemoteURLError):
+            mllm.download_video("http://127.0.0.1/internal.mp4")
+
+
+class TestAudioProcessing:
+    """Test audio processing functions."""
+
+    def test_process_audio_input_local_file(self, test_audio_path):
+        """Test processing local audio file."""
+        from vllm_mlx.models.mllm import process_audio_input
+
+        result = process_audio_input(test_audio_path)
+        assert result == test_audio_path
+
+    def test_process_audio_input_dict_format(self, test_audio_path):
+        """Test processing audio in dict format."""
+        from pathlib import Path
+
+        from vllm_mlx.models.mllm import process_audio_input
+
+        result = process_audio_input({"url": test_audio_path})
+        assert Path(result).exists()
+
+    def test_collect_audio_inputs(self):
+        """Audio items should be extracted and keyed by message index."""
+        from vllm_mlx.models.mllm import MLXMultimodalLM
+
+        model = MLXMultimodalLM.__new__(MLXMultimodalLM)
+        model._loaded = False
+        model._video_native = False
+
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "audio_url",
+                        "audio_url": {"url": "https://example.com/a.wav"},
+                    },
+                    {"type": "text", "text": "Transcribe this"},
+                ],
+            },
+            {
+                "role": "user",
+                "content": [
+                    {"type": "audio", "audio": "/tmp/b.wav"},
+                    {"type": "text", "text": "And this"},
+                ],
+            },
+        ]
+
+        result = model._collect_audio_inputs(messages)
+        assert result[0] == ["https://example.com/a.wav"]
+        assert result[1] == ["/tmp/b.wav"]
 
 
 # =============================================================================

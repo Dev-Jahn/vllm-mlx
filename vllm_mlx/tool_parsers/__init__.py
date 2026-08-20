@@ -9,7 +9,8 @@ Available parsers:
 - auto: Auto-detecting parser that tries all formats (default)
 - mistral: Mistral models ([TOOL_CALLS] format)
 - qwen/qwen3: Qwen models (<tool_call> and [Calling tool:] formats)
-- llama/llama3/llama4: Llama models (<function=name> format)
+- llama/llama3/llama4: Llama models (python-tag JSON, bare JSON, and legacy XML)
+- gemma4/gemma_4: Google Gemma 4 models (<|tool_call>call:name{} format)
 - hermes/nous: Hermes/NousResearch models
 - deepseek/deepseek_v3/deepseek_r1: DeepSeek models (unicode tokens)
 - kimi/kimi_k2/moonshot: Kimi/Moonshot models
@@ -19,6 +20,8 @@ Available parsers:
 - functionary/meetkai: MeetKai Functionary models
 - glm47/glm4: GLM-4.7 and GLM-4.7-Flash models
 - harmony/gpt-oss: GPT-OSS models (Harmony format with channels)
+- minimax: MiniMax-M2 models
+- step3p5/step: Step3p5/Step 3.7 Flash XML function calls
 
 Usage:
     from vllm_mlx.tool_parsers import ToolParserManager
@@ -47,6 +50,7 @@ from .abstract_tool_parser import (
 from .auto_tool_parser import AutoToolParser
 from .deepseek_tool_parser import DeepSeekToolParser
 from .functionary_tool_parser import FunctionaryToolParser
+from .gemma4_tool_parser import Gemma4ToolParser
 from .granite_tool_parser import GraniteToolParser
 from .hermes_tool_parser import HermesToolParser
 from .kimi_tool_parser import KimiToolParser
@@ -54,19 +58,52 @@ from .llama_tool_parser import LlamaToolParser
 from .mistral_tool_parser import MistralToolParser
 from .nemotron_tool_parser import NemotronToolParser
 from .qwen_tool_parser import QwenToolParser
+from .poolside_v1_tool_parser import PoolsideV1ToolParser
 from .xlam_tool_parser import xLAMToolParser
 from .glm47_tool_parser import Glm47ToolParser
 from .harmony_tool_parser import HarmonyToolParser
+from .minimax_tool_parser import MiniMaxToolParser
+from .qwen3_xml_tool_parser import Qwen3XMLToolParser
+from .step3p5_tool_parser import Step3p5ToolParser
+
+
+def get_parser_stop_tokens(
+    parser_name: str | None,
+    user_stops: list[str] | None,
+) -> list[str]:
+    """Merge user-supplied stops with parser-declared extras (deduped).
+
+    Some models declare end-of-generation tokens beyond the tokenizer's default
+    eos set — e.g. Gemma 4's ``<|tool_response>`` which signals the runtime's
+    turn after a tool call. Parsers expose those via ``extra_stop_tokens``.
+    """
+    stops = list(user_stops or [])
+    if not parser_name:
+        return stops
+    try:
+        parser_cls = ToolParserManager.get_tool_parser(parser_name)
+    except (KeyError, ImportError):
+        return stops
+    for s in getattr(parser_cls, "extra_stop_tokens", []):
+        if s not in stops:
+            stops.append(s)
+    return stops
+
 
 __all__ = [
     # Base classes
     "ToolParser",
     "ToolParserManager",
     "ExtractedToolCallInformation",
+    # Helpers
+    "get_parser_stop_tokens",
     # Specific parsers
     "AutoToolParser",
+    "Gemma4ToolParser",
     "MistralToolParser",
     "QwenToolParser",
+    "PoolsideV1ToolParser",
+    "Qwen3XMLToolParser",
     "LlamaToolParser",
     "HermesToolParser",
     "DeepSeekToolParser",
@@ -77,4 +114,6 @@ __all__ = [
     "FunctionaryToolParser",
     "Glm47ToolParser",
     "HarmonyToolParser",
+    "MiniMaxToolParser",
+    "Step3p5ToolParser",
 ]

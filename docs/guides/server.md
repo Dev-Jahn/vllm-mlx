@@ -2,6 +2,8 @@
 
 vllm-mlx provides a FastAPI server with full OpenAI API compatibility.
 
+By default the server binds only to `127.0.0.1`. Use `--host 0.0.0.0` only when you intentionally want to expose it beyond the local machine.
+
 ## Starting the Server
 
 ### Simple Mode (Default)
@@ -28,28 +30,56 @@ Memory-efficient caching for production:
 vllm-mlx serve mlx-community/Llama-3.2-3B-Instruct-4bit --port 8000 --continuous-batching --use-paged-cache
 ```
 
+### Registry-Backed Multi-Model Serving
+
+Serve a named registry of models behind one endpoint:
+
+```bash
+vllm-mlx serve --models-config /etc/vllm-mlx/models.yaml --port 8000
+```
+
+Clients route requests by setting the OpenAI `model` field to one of the configured registry names. See [Multi-Model Serving](model-registry.md) for the registry file format, eviction policy, and rollout guidance.
+
+### With Server-Wide Chat Template Defaults
+
+Set server defaults for chat template kwargs. Request-level `chat_template_kwargs`
+values still win per key.
+
+```bash
+vllm-mlx serve mlx-community/Qwen3-8B-4bit \
+  --reasoning-parser qwen3 \
+  --default-chat-template-kwargs '{"enable_thinking": false}'
+```
+
 ## Server Options
 
 | Option | Description | Default |
 |--------|-------------|---------|
 | `--port` | Server port | 8000 |
-| `--host` | Server host | 0.0.0.0 |
+| `--host` | Server host | 127.0.0.1 |
 | `--api-key` | API key for authentication | None |
 | `--rate-limit` | Requests per minute per client (0 = disabled) | 0 |
 | `--timeout` | Request timeout in seconds | 300 |
+| `--enable-metrics` | Expose Prometheus metrics on `/metrics` | False |
 | `--continuous-batching` | Enable batching for multi-user | False |
 | `--use-paged-cache` | Enable paged KV cache | False |
+| `--prefix-trie-cache` | Enable conversation-prefix reuse in pure-LLM SimpleEngine mode | False |
+| `--prefix-trie-cache-size` | Maximum SimpleEngine prompt-trie entries | 32 |
+| `--prefix-trie-cache-memory-mb` | Optional SimpleEngine prompt-trie memory cap in MB | None |
 | `--cache-memory-mb` | Cache memory limit in MB | Auto |
 | `--cache-memory-percent` | Fraction of RAM for cache | 0.20 |
 | `--max-tokens` | Default max tokens | 32768 |
+| `--max-request-tokens` | Maximum `max_tokens` accepted from API clients | 32768 |
 | `--default-temperature` | Default temperature when not specified | None |
 | `--default-top-p` | Default top_p when not specified | None |
+| `--default-chat-template-kwargs` | Default chat template kwargs used when request `chat_template_kwargs` is omitted (JSON object) | None |
 | `--stream-interval` | Tokens per stream chunk | 1 |
 | `--mcp-config` | Path to MCP config file | None |
 | `--reasoning-parser` | Parser for reasoning models (`qwen3`, `deepseek_r1`) | None |
 | `--embedding-model` | Pre-load an embedding model at startup | None |
 | `--enable-auto-tool-choice` | Enable automatic tool calling | False |
 | `--tool-call-parser` | Tool call parser (see [Tool Calling](tool-calling.md)) | None |
+| `--models-config` | YAML registry file for multi-model serving | None |
 
 ## API Endpoints
 
@@ -127,6 +157,23 @@ GET /health
 ```
 
 Returns server status.
+
+### Metrics
+
+```bash
+GET /metrics
+```
+
+Prometheus scrape endpoint for server, cache, scheduler, and request metrics.
+The endpoint is disabled by default and is enabled with `--enable-metrics`.
+
+```bash
+vllm-mlx serve mlx-community/Llama-3.2-3B-Instruct-4bit \
+  --enable-metrics
+```
+
+`/metrics` is intentionally unauthenticated. Expose it only on a trusted
+network or behind a reverse proxy / firewall that limits who can scrape it.
 
 ### Anthropic Messages API
 

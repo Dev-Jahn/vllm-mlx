@@ -162,6 +162,18 @@ curl http://localhost:8000/v1/chat/completions \
 | Local file | `{"type": "video", "video": "/path/to/video.mp4"}` |
 | Base64 | `{"type": "video_url", "video_url": {"url": "data:video/mp4;base64,..."}}` |
 
+### Remote URL safety
+
+Remote image, video, and audio URLs are checked before each fetch and redirect
+hop. URLs that resolve to localhost, link-local, private, or otherwise
+non-global addresses are rejected with a generic client error while detailed
+diagnostics stay in server logs.
+
+This validation does not pin the IP address used by the later HTTP transport
+connection. In environments where DNS rebinding or split-horizon DNS is in
+scope, run vllm-mlx behind network egress controls or fetch media through a
+trusted proxy that enforces the destination policy at connect time.
+
 ## Python API
 
 ```python
@@ -309,7 +321,7 @@ When memory pressure occurs, least recently accessed entries are evicted first.
 For interactive multimodal chat:
 
 ```bash
-vllm-mlx-chat --model mlx-community/Qwen3-VL-4B-Instruct-3bit
+vllm-mlx-chat --served-model-name mlx-community/Qwen3-VL-4B-Instruct-3bit
 ```
 
 Supports drag-and-drop images and videos.
