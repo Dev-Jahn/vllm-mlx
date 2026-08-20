@@ -413,8 +413,15 @@ def inject_mtp_support(model: Any, model_path, config: dict) -> bool:
             next_token_ids,
             cache=None,
             mtp_cache=None,
+            return_hidden: bool = False,
         ):
-            """Run MTP head: predict token n+2 from hidden states + token n+1."""
+            """Run MTP head: predict token n+2 from hidden states + token n+1.
+
+            With ``return_hidden=True``, also return the MTP hidden state
+            (selected by the checkpoint's hidden-state mode, mirroring the
+            backbone ``return_hidden`` contract) so chained multi-token
+            drafting can feed it back in as the next step's hidden input.
+            """
             input_embeds = self.model.embed_tokens(next_token_ids)
             e = self.mtp.pre_fc_norm_embedding(input_embeds)
             h = self.mtp.pre_fc_norm_hidden(hidden_states)
@@ -425,11 +432,20 @@ def inject_mtp_support(model: Any, model_path, config: dict) -> bool:
             mask = create_attention_mask(x, c)
             x = layer(x, mask=mask, cache=c)
 
-            x = self.mtp.norm(x)
+            normed = self.mtp.norm(x)
 
             if self.args.tie_word_embeddings:
-                return self.model.embed_tokens.as_linear(x)
-            return self.lm_head(x)
+                out = self.model.embed_tokens.as_linear(normed)
+            else:
+                out = self.lm_head(normed)
+
+            if return_hidden:
+                return out, _select_qwen_mtp_hidden_state(
+                    hidden_state_mode,
+                    x,
+                    normed,
+                )
+            return out
 
         def make_mtp_cache(self):
             """Create KV cache for MTP layers."""

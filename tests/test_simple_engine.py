@@ -2133,7 +2133,10 @@ class TestSimpleEngineConcurrency:
             "min_p": 0.0,
         }
         assert captured["prompt"] == [17]
-        assert captured["kwargs"]["mtp"] is True
+        # ``mtp=`` is not a valid mlx_lm.stream_generate kwarg (see #503); the
+        # continuation used to crash on it and silently re-run the whole
+        # normal path. The MTP cache stack is the real MTP-path contract.
+        assert "mtp" not in captured["kwargs"]
         assert captured["kwargs"]["prompt_cache"] == ["backbone-cache", "mtp-cache"]
         assert captured["kwargs"]["max_tokens"] == 3
         assert captured["kwargs"]["logits_processors"] is None

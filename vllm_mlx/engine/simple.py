@@ -202,6 +202,19 @@ class SimpleEngine(BaseEngine):
         self._mtp = mtp
         self._mtp_num_draft_tokens = mtp_num_draft_tokens
         self._prefill_step_size = prefill_step_size
+        # Chained multi-token MTP (text route). Probed at start(): requires the
+        # derived TextModel's cache entries to be restorable to the acceptance
+        # point (trimmable KVCache or snapshot-safe ArraysCache).
+        self._mtp_chain_capable = False
+        self._mtp_effective_draft_tokens = 1
+        # Cumulative chained-MTP counters for /v1/status (updated in place by
+        # mtp_chain_stream_generate on the generation worker thread).
+        self._mtp_text_stats: dict[str, int] = {
+            "requests": 0,
+            "rounds": 0,
+            "drafted": 0,
+            "accepted": 0,
+        }
 
         # Request stats (parity with BatchedEngine for /v1/status monitoring).
         # Without these, monitoring sees zero traffic for SimpleEngine-backed
@@ -740,13 +753,6 @@ class SimpleEngine(BaseEngine):
                 )
             self._loaded = True
 
-            if self._mtp and self._mtp_num_draft_tokens != 1:
-                logger.warning(
-                    "Native mlx_lm MTP currently ignores num_draft_tokens=%d; "
-                    "effective speculative draft depth remains 1",
-                    self._mtp_num_draft_tokens,
-                )
-
             # Probe whether this model's prompt cache is snapshot-safe for the
             # stream_chat system-prefix cache branch. This is also refreshed
             # below for MLLM text routing after the parallel TextModel exists.
@@ -870,11 +876,65 @@ class SimpleEngine(BaseEngine):
                     "For full MTP support, use: --enable-mtp --continuous-batching"
                 )
 
+            # Probe chained multi-token MTP capability for the text route:
+            # every cache entry of the derived TextModel must be restorable to
+            # the acceptance point (trimmable KVCache, or ArraysCache via
+            # snapshot). RotatingKVCache and unknown classes disqualify.
+            self._mtp_chain_capable = False
+            if (
+                self._mtp
+                and self._text_model is not None
+                and getattr(self._text_model, "mtp", None) is not None
+            ):
+                try:
+                    from mlx_lm.models.cache import make_prompt_cache
+
+                    from ..mtp_chain_stream import (
+                        cache_supports_chained_mtp,
+                        model_supports_chained_mtp,
+                    )
+
+                    probe_cache = make_prompt_cache(self._text_model)
+                    self._mtp_chain_capable = model_supports_chained_mtp(
+                        self._text_model
+                    ) and cache_supports_chained_mtp(probe_cache)
+                except Exception as e:
+                    logger.warning(
+                        "[MTP] chained-drafting capability probe failed (%s); "
+                        "draft depth stays at 1",
+                        e,
+                    )
+                    self._mtp_chain_capable = False
+
+            self._mtp_effective_draft_tokens = (
+                self._mtp_num_draft_tokens
+                if (self._mtp_num_draft_tokens > 1 and self._mtp_chain_capable)
+                else 1
+            )
+            if self._mtp and self._mtp_num_draft_tokens > 1:
+                if self._mtp_effective_draft_tokens > 1:
+                    logger.info(
+                        "[MTP] Chained drafting active on the text route: "
+                        "num_draft_tokens=%d per speculative round (greedy "
+                        "requests only; temperature>0 requests decode without "
+                        "speculation)",
+                        self._mtp_num_draft_tokens,
+                    )
+                else:
+                    logger.warning(
+                        "[MTP] num_draft_tokens=%d requested but chained "
+                        "drafting is unavailable for this configuration "
+                        "(text routing inactive, model lacks an MTP head, or "
+                        "its cache cannot be restored to the acceptance "
+                        "point); effective speculative draft depth remains 1",
+                        self._mtp_num_draft_tokens,
+                    )
+
             mtp_info = ""
             if self._mtp:
                 mtp_info = (
                     f", MTP={self._mtp}(configured={self._mtp_num_draft_tokens}, "
-                    "effective=1)"
+                    f"effective={self._mtp_effective_draft_tokens})"
                 )
             routing = ", routing=per-request" if self._text_model is not None else ""
             specprefill_info = (
@@ -2834,13 +2894,48 @@ class SimpleEngine(BaseEngine):
             prompt,
             remaining_tokens: int,
         ) -> None:
+            has_mtp_head = (
+                hasattr(model, "make_mtp_cache")
+                and getattr(model, "mtp", None) is not None
+            )
+            if (
+                has_mtp_head
+                and self._mtp
+                and self._mtp_num_draft_tokens > 1
+                and temperature == 0
+                and self._mtp_chain_capable
+            ):
+                # Resume the content phase with chained multi-token drafting
+                # on the retained backbone cache. The MTP head's KV cache is
+                # per-round inside the generator, so no stale speculative
+                # state can survive the processor-to-content handoff.
+                from ..mtp_chain_stream import mtp_chain_stream_generate
+
+                for resp in mtp_chain_stream_generate(
+                    model,
+                    self._text_tokenizer,
+                    prompt=prompt,
+                    max_tokens=remaining_tokens,
+                    num_draft_tokens=self._mtp_num_draft_tokens,
+                    prompt_cache=prompt_cache,
+                    prefill_step_size=self._prefill_step_size,
+                    stats=self._mtp_text_stats,
+                ):
+                    if abort_event.is_set():
+                        logger.info(
+                            "Text route: abort requested; stopping resume decode"
+                        )
+                        break
+                    _emit_response(resp)
+                return
+
             resume_kwargs = dict(
                 max_tokens=remaining_tokens,
                 sampler=sampler,
                 prefill_step_size=self._prefill_step_size,
                 prompt_cache=prompt_cache,
             )
-            if hasattr(model, "make_mtp_cache") and model.mtp is not None:
+            if has_mtp_head:
                 # Resume speculative decode from the retained backbone cache with
                 # a fresh MTP cache so stale speculative state cannot survive the
                 # processor-to-content handoff.
@@ -2872,6 +2967,24 @@ class SimpleEngine(BaseEngine):
             if self._mtp and custom_logits_active:
                 logger.info(
                     "Text route: disabling MTP for request-local logits processors"
+                )
+            # Chained multi-token drafting (num_draft_tokens > 1) is greedy-only:
+            # drafts are accepted by exact match against the target argmax.
+            # Sampling requests (temperature > 0) fall back to the existing
+            # non-speculative path.
+            use_chained_mtp = (
+                use_mtp
+                and self._mtp_num_draft_tokens > 1
+                and temperature == 0
+                and self._mtp_chain_capable
+            )
+            if use_mtp and self._mtp_num_draft_tokens > 1 and not use_chained_mtp:
+                logger.info(
+                    "Text route: chained MTP inactive for this request "
+                    "(temperature=%s, chain_capable=%s); decoding without "
+                    "speculation",
+                    temperature,
+                    self._mtp_chain_capable,
                 )
 
             # Cache MISS with valid prefix: prefill system tokens and snapshot
@@ -2934,7 +3047,7 @@ class SimpleEngine(BaseEngine):
             # --- SpecPrefill path (with fallback to normal on failure) ---
             if use_specprefill:
                 try:
-                    _run_specprefill(model, backbone_cache, use_mtp)
+                    _run_specprefill(model, backbone_cache, use_mtp, use_chained_mtp)
                     return
                 except Exception as e:
                     logger.error(
@@ -2944,6 +3057,33 @@ class SimpleEngine(BaseEngine):
                     # Discard potentially corrupted cache
                     backbone_cache = None
                     prompt_to_send = full_prompt
+
+            # --- Chained multi-token MTP path (greedy, num_draft_tokens > 1) ---
+            # Runs the speculative draft/verify loop in vllm_mlx instead of
+            # mlx_lm.stream_generate (which drops num_draft_tokens without a
+            # draft model). Uses the backbone cache only; the MTP head's KV
+            # cache is managed per-round inside the generator.
+            if use_chained_mtp:
+                from ..mtp_chain_stream import mtp_chain_stream_generate
+
+                for resp in mtp_chain_stream_generate(
+                    model,
+                    self._text_tokenizer,
+                    prompt=prompt_to_send,
+                    max_tokens=max_tokens,
+                    num_draft_tokens=self._mtp_num_draft_tokens,
+                    prompt_cache=backbone_cache,
+                    prefill_step_size=self._prefill_step_size,
+                    stats=self._mtp_text_stats,
+                ):
+                    if abort_event.is_set():
+                        logger.info(
+                            "Text route: abort requested; stopping chained "
+                            "MTP decode"
+                        )
+                        break
+                    _emit_response(resp)
+                return
 
             # --- Normal path (mlx_lm stream_generate) ---
             prompt_cache = None
@@ -3022,7 +3162,7 @@ class SimpleEngine(BaseEngine):
                         break
                     _emit_response(resp)
 
-        def _run_specprefill(model, bc, use_mtp):
+        def _run_specprefill(model, bc, use_mtp, use_chained_mtp=False):
             """Score tokens, sparse prefill, then continue on the standard decode path."""
             from types import SimpleNamespace
 
@@ -3158,6 +3298,32 @@ class SimpleEngine(BaseEngine):
                     )
                     return
 
+                if use_chained_mtp:
+                    # Continue the decode with chained multi-token drafting on
+                    # the sparse-prefilled backbone cache. use_chained_mtp
+                    # implies use_mtp, which implies no request-local logits
+                    # processors are active.
+                    from ..mtp_chain_stream import mtp_chain_stream_generate
+
+                    for resp in mtp_chain_stream_generate(
+                        model,
+                        self._text_tokenizer,
+                        prompt=continuation_prompt,
+                        max_tokens=max_tokens - token_count,
+                        num_draft_tokens=self._mtp_num_draft_tokens,
+                        prompt_cache=bc,
+                        prefill_step_size=self._prefill_step_size,
+                        stats=self._mtp_text_stats,
+                    ):
+                        if abort_event.is_set():
+                            logger.info(
+                                "SpecPrefill text route: abort requested; "
+                                "stopping chained MTP decode"
+                            )
+                            break
+                        _emit_response(resp)
+                    return
+
                 last_resp = None
                 retired = False
                 for resp in mlx_stream_generate(
@@ -3169,7 +3335,6 @@ class SimpleEngine(BaseEngine):
                     prefill_step_size=self._prefill_step_size,
                     logits_processors=seeded_processors,
                     prompt_cache=prompt_cache,
-                    mtp=use_mtp,
                 ):
                     if abort_event.is_set():
                         logger.info(
@@ -3252,6 +3417,8 @@ class SimpleEngine(BaseEngine):
                     completion_tokens=token_count,
                     finished=finished,
                     finish_reason=finish_reason,
+                    mtp_drafts=getattr(resp, "mtp_drafts", 0),
+                    mtp_accepted=getattr(resp, "mtp_accepted", 0),
                 )
 
                 if finished:
@@ -3339,6 +3506,28 @@ class SimpleEngine(BaseEngine):
                         "cache_entries", raw_cache.get("entries", 0)
                     ),
                 }
+
+        # Native MTP stats (text-route chained drafting; parity with the
+        # BatchedEngine "mtp" block consumed by /v1/status).
+        if self._mtp:
+            drafted = self._mtp_text_stats["drafted"]
+            accepted = self._mtp_text_stats["accepted"]
+            stats["mtp"] = {
+                "enabled": True,
+                "configured_draft_tokens": self._mtp_num_draft_tokens,
+                "effective_draft_tokens": self._mtp_effective_draft_tokens,
+                "chain_capable": self._mtp_chain_capable,
+                "greedy_only": True,
+                "text_route": {
+                    "requests": self._mtp_text_stats["requests"],
+                    "rounds": self._mtp_text_stats["rounds"],
+                    "drafted": drafted,
+                    "accepted": accepted,
+                    "acceptance_rate": (
+                        round(accepted / drafted, 4) if drafted else 0.0
+                    ),
+                },
+            }
 
         # SpecPrefill stats
         if self._draft_model is not None:
